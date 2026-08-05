@@ -41,9 +41,9 @@ class Main:
         # setup ik solver (for reachability cost)
         assert isinstance(self.env.robot, Fetch), "The IK solver assumes the robot is a Fetch robot"
         ik_solver = IKSolver(
-            robot_description_path=self.env.robot.robot_arm_descriptor_yamls[self.env.robot.default_arm],
+            robot_description_path=os.path.join(os.path.dirname(__file__), "configs", "fetch_descriptor.yaml"),
             robot_urdf_path=self.env.robot.urdf_path,
-            eef_name=self.env.robot.eef_link_names[self.env.robot.default_arm],
+            eef_name="wrist_roll_link",
             reset_joint_pos=self.env.reset_joint_pos,
             world2robot_homo=self.env.world2robot_homo,
         )
@@ -110,6 +110,7 @@ class Main:
         while True:
             scene_keypoints = self.env.get_keypoint_positions()
             self.keypoints = np.concatenate([[self.env.get_ee_pos()], scene_keypoints], axis=0)  # first keypoint is always the ee
+            print(f"[DEBUG keypoints] stage={self.stage} ee={np.round(self.keypoints[0],4)} scene={np.round(scene_keypoints,4).tolist()} movable={self.keypoint_movable_mask.tolist()}", flush=True)
             self.curr_ee_pose = self.env.get_ee_pose()
             self.curr_joint_pos = self.env.get_arm_joint_postions()
             self.sdf_voxels = self.env.get_sdf_voxels(self.config['sdf_voxel_size'])

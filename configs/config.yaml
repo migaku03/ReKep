@@ -17,7 +17,8 @@ env:
   video_cache_size: 2000
   og_sim:
     physics_frequency: 100
-    action_frequency: 15
+    rendering_frequency: 20
+    action_frequency: 20
     
   scene:
     name: Rs_int

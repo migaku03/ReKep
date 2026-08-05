@@ -1,0 +1,35 @@
+# Lula robot descriptor for the Fetch robot, hand-authored for use with ReKep's
+# CCD-based IKSolver (omnigibson.lazy.lula). The original fetch_descriptor.yaml
+# shipped with an older OmniGibson asset package that is no longer distributed;
+# this recreates the minimum needed for lula.load_robot() + compute_ik_ccd().
+#
+# Note: the IK target link is "wrist_roll_link" rather than OmniGibson's
+# runtime-only "eef_link" meta-link, since the latter only exists in the
+# processed USD stage, not in the raw URDF that lula parses. The resulting
+# few-cm offset (gripper length) is acceptable because this IK result is only
+# used as a soft reachability cost inside ReKep's optimizer, not for final
+# robot control.
+
+api_version: 1.0
+
+cspace:
+    - torso_lift_joint
+    - shoulder_pan_joint
+    - shoulder_lift_joint
+    - upperarm_roll_joint
+    - elbow_flex_joint
+    - forearm_roll_joint
+    - wrist_flex_joint
+    - wrist_roll_joint
+
+root_link: base_link
+
+default_q: [0.02, 1.32, 0.7, 0.0, 1.72, 0.0, 1.66, 0.0]
+
+cspace_to_urdf_rules:
+    - {name: r_wheel_joint, rule: fixed, value: 0.0}
+    - {name: l_wheel_joint, rule: fixed, value: 0.0}
+    - {name: head_pan_joint, rule: fixed, value: 0.0}
+    - {name: head_tilt_joint, rule: fixed, value: 0.45}
+    - {name: r_gripper_finger_joint, rule: fixed, value: 0.05}
+    - {name: l_gripper_finger_joint, rule: fixed, value: 0.05}

@@ -1,5 +1,6 @@
 import time
 import numpy as np
+import torch as th
 import os
 import datetime
 import transform_utils as T
@@ -67,17 +68,66 @@ class ReKepOGEnv:
         # create omnigibson environment
         self.step_counter = 0
         self.og_env = og.Environment(dict(scene=self.config['scene'], robots=[self.config['robot']['robot_config']], env=self.config['og_sim']))
-        self.og_env.scene.update_initial_state()
+        self._zero_object_velocities()
+        # let the table drop onto the floor and everything come to rest before snapshotting
+        # the initial state, so that reset() restores a settled scene rather than a falling one
+        for _ in range(30): og.sim.step()
+        self._zero_object_velocities()
+        self.og_env.scene.update_initial_file()
         for _ in range(10): og.sim.step()
         # robot vars
         self.robot = self.og_env.robots[0]
         dof_idx = np.concatenate([self.robot.trunk_control_idx,
                                   self.robot.arm_control_idx[self.robot.default_arm]])
-        self.reset_joint_pos = self.robot.reset_joint_pos[dof_idx]
+        reset_joint_pos = self.robot.reset_joint_pos[dof_idx]
+        self.reset_joint_pos = reset_joint_pos.detach().cpu().numpy() if hasattr(reset_joint_pos, "detach") else np.asarray(reset_joint_pos)
         self.world2robot_homo = T.pose_inv(T.pose2mat(self.robot.get_position_orientation()))
+        # action vector layout. ReKep originally hardcoded the indices for the arm/gripper
+        # commands, but OmniGibson has since added a separate "trunk" controller to Fetch,
+        # which shifts every controller after it by one slot. The total action dim happens to
+        # stay 12, so the mismatch is silent -- query the mapping from the robot instead.
+        action_idx = self.robot.controller_action_idx
+        self.arm_action_idx = T.to_numpy(action_idx[f'arm_{self.robot.default_arm}']).astype(int)
+        self.gripper_action_idx = T.to_numpy(action_idx[f'gripper_{self.robot.default_arm}']).astype(int)
+        assert len(self.arm_action_idx) == 6, f"expected a 6-DOF arm controller, got {len(self.arm_action_idx)}"
+        print(f"[environment.py] action_dim={self.robot.action_dim} layout=" +
+              str({k: T.to_numpy(v).tolist() for k, v in action_idx.items()}), flush=True)
+        # geometry sanity check. The scene file was authored against the 2024 asset package;
+        # the table model has since been swapped and the pen mesh's canonical axes rotated, so
+        # the placements were recomputed from the current assets' metadata. Verify them.
+        for _name in ('table_1', 'pen_1', 'pencil_holder_1'):
+            _obj = self.og_env.scene.object_registry("name", _name)
+            if _obj is None:
+                print(f"[environment.py] AABB {_name}: NOT FOUND", flush=True)
+                continue
+            _lo, _hi = (T.to_numpy(_v) for _v in _obj.aabb)
+            print(f"[environment.py] AABB {_name}: z=[{_lo[2]:.4f}, {_hi[2]:.4f}] "
+                  f"xy=[{_lo[0]:.3f},{_lo[1]:.3f}]-[{_hi[0]:.3f},{_hi[1]:.3f}]", flush=True)
         # initialize cameras
         self._initialize_cameras(self.config['camera'])
         self.last_og_gripper_action = 1.0
+
+    def _zero_object_velocities(self):
+        """
+        Restoring a saved scene puts every object back in place but does NOT restore its
+        velocity, so whatever an object picked up while the scene was being assembled
+        survives the restore. The pen holder in particular starts out with ~5 m/s upward
+        and ~76 rad/s of spin and immediately launches itself off the table -- the scene
+        file records zero velocity for it. Clear the leftover motion before the sim runs.
+        """
+        zero = th.zeros(3, dtype=th.float32)
+        for obj in self.og_env.scene.objects:
+            # walls/floors/ceilings are kinematic: the entity exposes set_linear_velocity
+            # but its root link does not implement it, so check the link itself
+            root = getattr(obj, "root_link", None)
+            if root is None or not hasattr(root, "set_linear_velocity"):
+                continue
+            obj.set_linear_velocity(zero)
+            obj.set_angular_velocity(zero)
+
+    def _empty_action(self):
+        """Zero action vector sized to the robot's actual action space."""
+        return np.zeros(self.robot.action_dim)
 
     # ======================================
     # = exposed functions
@@ -260,6 +310,7 @@ class ReKepOGEnv:
 
     def reset(self):
         self.og_env.reset()
+        self._zero_object_velocities()  # og_env.reset() restores poses but not velocities
         self.robot.reset()
         for _ in range(5): self._step()
         self.open_gripper()
@@ -275,7 +326,7 @@ class ReKepOGEnv:
         return self.robot.is_grasping(candidate_obj=candidate_obj) == IsGraspingState.TRUE
 
     def get_ee_pose(self):
-        ee_pos, ee_xyzw = (self.robot.get_eef_position(), self.robot.get_eef_orientation())
+        ee_pos, ee_xyzw = (T.to_numpy(self.robot.get_eef_position()), T.to_numpy(self.robot.get_eef_orientation()))
         ee_pose = np.concatenate([ee_pos, ee_xyzw])  # [7]
         return ee_pose
 
@@ -289,7 +340,7 @@ class ReKepOGEnv:
         assert isinstance(self.robot, Fetch), "The IK solver assumes the robot is a Fetch robot"
         arm = self.robot.default_arm
         dof_idx = np.concatenate([self.robot.trunk_control_idx, self.robot.arm_control_idx[arm]])
-        arm_joint_pos = self.robot.get_joint_positions()[dof_idx]
+        arm_joint_pos = T.to_numpy(self.robot.get_joint_positions())[dof_idx]
         return arm_joint_pos
 
     def close_gripper(self):
@@ -299,17 +350,40 @@ class ReKepOGEnv:
         """
         if self.last_og_gripper_action == 0.0:
             return
-        action = np.zeros(12)
-        action[10:] = [0, 0]  # gripper: float. 0. for closed, 1. for open.
+        action = self._empty_action()
+        action[self.gripper_action_idx] = 0.0  # gripper: float. 0. for closed, 1. for open.
         for _ in range(30):
             self._step(action)
         self.last_og_gripper_action = 0.0
+        self._report_grasp_state()
+
+    def _report_grasp_state(self):
+        """Temporary diagnostic: why does assisted grasping not latch onto the pen?"""
+        arm = self.robot.default_arm
+        try:
+            finger_names = self.robot.finger_joint_names[arm]
+            jpos = T.to_numpy(self.robot.get_joint_positions())
+            jidx = {n: i for i, n in enumerate(self.robot.joints.keys())}
+            fingers = {n: round(float(jpos[jidx[n]]), 5) for n in finger_names if n in jidx}
+            candidates, contact_links = self.robot._find_gripper_contacts(arm=arm)
+            finger_prims = {l.prim_path for l in self.robot.finger_links[arm]}
+            per_obj = {c: sorted(p.split('/')[-1] for p in finger_prims.intersection(contact_links.get(c, set())))
+                       for c in candidates}
+            raycast = self.robot._find_gripper_raycast_collisions(arm=arm)
+            in_hand = self.robot._ag_obj_in_hand[arm]
+            print(f"[GRASP] fingers={fingers}", flush=True)
+            print(f"[GRASP] contacts={sorted(candidates)}", flush=True)
+            print(f"[GRASP] fingers_touching_per_obj={per_obj}", flush=True)
+            print(f"[GRASP] raycast_hits={sorted(raycast)}", flush=True)
+            print(f"[GRASP] ag_obj_in_hand={in_hand.name if in_hand is not None else None}", flush=True)
+        except Exception as e:
+            print(f"[GRASP] diagnostic failed: {type(e).__name__}: {e}", flush=True)
 
     def open_gripper(self):
         if self.last_og_gripper_action == 1.0:
             return
-        action = np.zeros(12)
-        action[10:] = [1, 1]  # gripper: float. 0. for closed, 1. for open.
+        action = self._empty_action()
+        action[self.gripper_action_idx] = 1.0  # gripper: float. 0. for closed, 1. for open.
         for _ in range(30):
             self._step(action)
         self.last_og_gripper_action = 1.0
@@ -393,7 +467,7 @@ class ReKepOGEnv:
                 self._move_to_waypoint(pose, intermediate_pos_threshold, intermediate_rot_threshold)
             # move to the final pose with required precision
             pose = pose_seq[-1]
-            self._move_to_waypoint(pose, pos_threshold, rot_threshold, max_steps=20 if not precise else 40) 
+            self._move_to_waypoint(pose, pos_threshold, rot_threshold, max_steps=20 if not precise else 120)
             # compute error
             pos_error, rot_error = self.compute_target_delta_ee(target_pose)
             self.verbose and print(f'\n{bcolors.BOLD}[environment.py | {get_clock_time()}] Move to pose completed (pos_error: {pos_error}, rot_error: {np.rad2deg(rot_error)}){bcolors.ENDC}\n')
@@ -435,8 +509,8 @@ class ReKepOGEnv:
         """
         this is supposed to be for true ee pose (franka hand) in robot frame
         """
-        current_pos = self.robot.get_eef_position()
-        current_xyzw = self.robot.get_eef_orientation()
+        current_pos = T.to_numpy(self.robot.get_eef_position())
+        current_xyzw = T.to_numpy(self.robot.get_eef_orientation())
         current_rotmat = T.quat2mat(current_xyzw)
         target_rotmat = T.quat2mat(target_xyzw)
         # calculate position delta
@@ -444,6 +518,7 @@ class ReKepOGEnv:
         pos_error = np.linalg.norm(pos_diff)
         # calculate rotation delta
         rot_error = angle_between_rotmat(current_rotmat, target_rotmat)
+        print(f"[DEBUG check_reached] world_curr_pos={np.round(current_pos,4)} world_curr_quat={np.round(current_xyzw,4)} world_target_pos={np.round(target_pos,4)} world_target_quat={np.round(target_xyzw,4)}", flush=True)
         # print status
         self.verbose and print(f'{bcolors.WARNING}[environment.py | {get_clock_time()}]  Curr pose: {current_pos}, {current_xyzw} (pos_error: {pos_error.round(4)}, rot_error: {np.rad2deg(rot_error).round(4)}){bcolors.ENDC}')
         self.verbose and print(f'{bcolors.WARNING}[environment.py | {get_clock_time()}]  Goal pose: {target_pos}, {target_xyzw} (pos_thres: {pos_threshold}, rot_thres: {rot_threshold}){bcolors.ENDC}')
@@ -465,13 +540,21 @@ class ReKepOGEnv:
             # convert world pose to robot pose
             target_pose_robot = np.dot(self.world2robot_homo, T.convert_pose_quat2mat(target_pose_world))
             # convert to relative pose to be used with the underlying controller
-            relative_position = target_pose_robot[:3, 3] - self.robot.get_relative_eef_position()
-            relative_quat = T.quat_distance(T.mat2quat(target_pose_robot[:3, :3]), self.robot.get_relative_eef_orientation())
+            rel_eef_pos = T.to_numpy(self.robot.get_relative_eef_position())
+            rel_eef_quat = T.to_numpy(self.robot.get_relative_eef_orientation())
+            target_quat_robot = T.mat2quat(target_pose_robot[:3, :3])
+            relative_position = target_pose_robot[:3, 3] - rel_eef_pos
+            relative_quat = T.quat_distance(target_quat_robot, rel_eef_quat)
+            relative_axisangle = T.quat2axisangle(relative_quat)
+            print(f"[DEBUG waypoint] target_world_pos={np.round(target_pose_world[:3],4)} target_world_quat={np.round(target_pose_world[3:7],4)}", flush=True)
+            print(f"[DEBUG waypoint] target_robot_pos={np.round(target_pose_robot[:3,3],4)} target_robot_quat={np.round(target_quat_robot,4)}", flush=True)
+            print(f"[DEBUG waypoint] curr_rel_eef_pos={np.round(rel_eef_pos,4)} curr_rel_eef_quat={np.round(rel_eef_quat,4)}", flush=True)
+            print(f"[DEBUG waypoint] relative_position={np.round(relative_position,4)} relative_quat={np.round(relative_quat,4)} relative_axisangle={np.round(relative_axisangle,4)} |axisangle|={np.round(np.linalg.norm(relative_axisangle),4)}", flush=True)
             assert isinstance(self.robot, Fetch), "this action space is only for fetch"
-            action = np.zeros(12)  # first 3 are base, which we don't use
-            action[4:7] = relative_position
-            action[7:10] = T.quat2axisangle(relative_quat)
-            action[10:] = [self.last_og_gripper_action, self.last_og_gripper_action]
+            action = self._empty_action()  # base/trunk/camera stay at zero
+            action[self.arm_action_idx[:3]] = relative_position
+            action[self.arm_action_idx[3:]] = relative_axisangle
+            action[self.gripper_action_idx] = self.last_og_gripper_action
             # step the action
             _ = self._step(action=action)
             count += 1

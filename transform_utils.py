@@ -12,6 +12,10 @@ from scipy.spatial.transform import Rotation as R
 PI = np.pi
 EPS = np.finfo(float).eps * 4.0
 
+def to_numpy(x):
+    """Converts a torch tensor (or anything array-like) to a numpy array."""
+    return x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
+
 # axis sequences for Euler angles
 _NEXT_AXIS = [1, 2, 0, 1]
 
@@ -455,9 +459,11 @@ def pose2mat(pose):
     Returns:
         np.array: 4x4 homogeneous matrix
     """
-    homo_pose_mat = np.zeros((4, 4), dtype=pose[0].dtype)
-    homo_pose_mat[:3, :3] = quat2mat(pose[1])
-    homo_pose_mat[:3, 3] = np.array(pose[0], dtype=pose[0].dtype)
+    pos = pose[0].detach().cpu().numpy() if hasattr(pose[0], "detach") else np.asarray(pose[0])
+    orn = pose[1].detach().cpu().numpy() if hasattr(pose[1], "detach") else np.asarray(pose[1])
+    homo_pose_mat = np.zeros((4, 4), dtype=pos.dtype)
+    homo_pose_mat[:3, :3] = quat2mat(orn)
+    homo_pose_mat[:3, 3] = pos
     homo_pose_mat[3, 3] = 1.0
     return homo_pose_mat
 

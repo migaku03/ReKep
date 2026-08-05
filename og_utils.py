@@ -25,11 +25,13 @@ class OGCamera:
         No semantic handling here for now.
         """
         obs = self.cam.get_obs()
+        def _to_numpy(x):
+            return x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
         ret = {}
-        ret["rgb"] = obs[0]["rgb"][:,:,:3]  # H, W, 3
-        ret["depth"] = obs[0]["depth_linear"]  # H, W
+        ret["rgb"] = _to_numpy(obs[0]["rgb"])[:,:,:3]  # H, W, 3
+        ret["depth"] = _to_numpy(obs[0]["depth_linear"])  # H, W
         ret["points"] = pixel_to_3d_points(ret["depth"], self.intrinsics, self.extrinsics)  # H, W, 3
-        ret["seg"] = obs[0]["seg_semantic"]  # H, W
+        ret["seg"] = _to_numpy(obs[0]["seg_semantic"])  # H, W
         ret["intrinsic"] = self.intrinsics
         ret["extrinsic"] = self.extrinsics
         return ret
