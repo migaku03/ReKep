@@ -8,6 +8,7 @@ import trimesh
 import open3d as o3d
 import imageio
 import omnigibson as og
+import omnigibson.lazy as lazy
 from omnigibson.macros import gm
 from omnigibson.utils.usd_utils import PoseAPI, mesh_prim_mesh_to_trimesh_mesh, mesh_prim_shape_to_trimesh_mesh
 from omnigibson.robots.fetch import Fetch
@@ -55,6 +56,38 @@ def custom_clip_control(self, control):
 Fetch._initialize = ManipulationRobot._initialize
 BaseController.clip_control = custom_clip_control
 
+# Deliberate appearance overrides, applied after the scene loads. Maps object name to the
+# multiplicative diffuse tint to force onto every material the object owns.
+#
+# pencil_holder_1 renders as a pale beige vessel, but the demo -- and the cached VLM
+# constraints, which talk about "the black pen holder" -- were written against a black one.
+# The model id (pencil_holder/muqeud) and scale still match upstream, so this is the asset
+# having been re-authored underneath us rather than anything being applied wrongly: the
+# diffuse and normal maps share one UV layout and agree with each other, i.e. the mesh really
+# does map its outer wall onto the beige part of the atlas now. Nothing to repair here, and
+# nothing repairable anyway -- the model ships as muqeud.encrypted.usd and the 2024 asset
+# package is gone. Substituting one of the other ten pencil_holder models is worse: their
+# diffuse maps are flat light grey, so they are not black either, and moving the mesh would
+# strand the cached keypoints that sit on this one.
+#
+# So state the colour the demo assumes, explicitly, as a scene override.
+#
+# Tinting alone left the inside of the holder looking like brushed metal. That is a second,
+# separate defect in the same asset: muqeud's reflection map is baked against a different UV
+# layout than its diffuse and normal maps (which do agree with each other), so it scatters
+# bright highlights into the wrong places. omnigibson_vray_mtl.mdl wires the material's
+# Reflection straight to reflection_texture's tint and reflection_metalness to
+# metalness_texture's mono channel, so pointing both at a black image zeroes the reflection
+# lobe outright. Hence 'matte'.
+#
+# What this still does not fix: the silhouette stays crumpled rather than cylindrical. That
+# is mesh geometry, inside the encrypted USD, and out of reach from here.
+BLACK_TEXTURE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'assets', 'black.png')
+
+APPEARANCE_OVERRIDES = {
+    'pencil_holder_1': dict(diffuse_tint=(0.06, 0.06, 0.06), matte=True),
+}
+
 class ReKepOGEnv:
     def __init__(self, config, scene_file, verbose=False):
         self.video_cache = []
@@ -68,6 +101,9 @@ class ReKepOGEnv:
         # create omnigibson environment
         self.step_counter = 0
         self.og_env = og.Environment(dict(scene=self.config['scene'], robots=[self.config['robot']['robot_config']], env=self.config['og_sim']))
+        # before anything is stepped or rendered, so the scene is never shown in the wrong
+        # colours and no recorded frame catches the transition
+        self._apply_appearance_overrides()
         self._zero_object_velocities()
         # let the table drop onto the floor and everything come to rest before snapshotting
         # the initial state, so that reset() restores a settled scene rather than a falling one
@@ -124,6 +160,46 @@ class ReKepOGEnv:
                 continue
             obj.set_linear_velocity(zero)
             obj.set_angular_velocity(zero)
+
+    def _apply_appearance_overrides(self):
+        """Apply the scene overrides listed in APPEARANCE_OVERRIDES.
+
+        diffuse_tint multiplies the sampled albedo, so it darkens the whole surface while
+        keeping its shading, which is what we want here -- albedo_add would just flatten it.
+        Only the V-Ray and OmniPBR material classes implement the setter; the base
+        MaterialPrim's is a no-op, so read the value back and report what actually stuck
+        rather than assuming it applied.
+        """
+        black = lazy.pxr.Sdf.AssetPath(BLACK_TEXTURE)
+        for name, spec in APPEARANCE_OVERRIDES.items():
+            obj = self.og_env.scene.object_registry("name", name)
+            if obj is None:
+                print(f"[environment.py] appearance {name}: NOT FOUND", flush=True)
+                continue
+            tint = spec['diffuse_tint']
+            # VRayMaterialPrim.diffuse_tint's setter calls color.tolist(), so it needs a
+            # tensor rather than a plain tuple
+            tint_t = th.tensor(tint, dtype=th.float32)
+            applied = 0
+            for material in obj.materials:
+                material.diffuse_tint = tint_t
+                readback = material.diffuse_tint
+                if readback is not None and np.allclose(T.to_numpy(readback), tint, atol=1e-4):
+                    applied += 1
+                else:
+                    print(f"[environment.py] appearance {name}: {type(material).__name__} at "
+                          f"{material.prim_path} did not take the tint (read back "
+                          f"{readback})", flush=True)
+                if spec.get('matte'):
+                    for inp in ('reflection_texture', 'metalness_texture'):
+                        try:
+                            material.set_input(inp=inp, val=black)
+                        except Exception as e:
+                            print(f"[environment.py] appearance {name}: could not blank "
+                                  f"{inp}: {type(e).__name__}: {e}", flush=True)
+            print(f"[environment.py] appearance {name}: tint {tint} applied to {applied}/"
+                  f"{len(obj.materials)} materials"
+                  f"{', reflection blanked' if spec.get('matte') else ''}", flush=True)
 
     def _empty_action(self):
         """Zero action vector sized to the robot's actual action space."""
@@ -683,4 +759,8 @@ class ReKepOGEnv:
         for cam_id in cam_config:
             cam_id = int(cam_id)
             self.cams[cam_id] = OGCamera(self.og_env, cam_config[cam_id])
+        # NOTE: do not warm the sensors with og.sim.step() here. Stepping advances physics,
+        # and this runs after the settled scene has been snapshotted, so the extra steps
+        # leave the robot and the objects somewhere the rest of the pipeline does not expect
+        # -- measured: 374 unreached waypoints and 51 joint-limit hits versus 0 of each.
         for _ in range(10): og.sim.render()
