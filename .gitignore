@@ -8,3 +8,4 @@ run_log*.txt
 pip_*log.txt
 *.bak
 .vscode/
+videos/

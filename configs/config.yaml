@@ -45,6 +45,16 @@ env:
           name: DifferentialDriveController
         arm_0:
           name: OperationalSpaceController
+          # Give the trunk back to the arm controller. In the OmniGibson this demo was written
+          # against, Fetch._default_controller_config forced the arm controller's dof_idx to
+          # concat(trunk_control_idx, arm_control_idx), so the OSC solved for 8 joints. The
+          # trunk has since been split out into its own JointController, leaving the OSC with
+          # 7 -- while configs/fetch_descriptor.yaml still declares an 8-joint cspace, so the
+          # subgoal/path solvers keep reporting ik_feasible for poses the executor cannot
+          # reach. Measured consequence: on the "lift the pen over the holder" stage the
+          # wrist_flex joint pins against its +2.16 rad limit and the eef freezes 12.5 cm
+          # short, with the trunk held at 0.38 and zero commanded velocity.
+          subsume_controllers: [trunk]
           kp: 250
           kp_limits: [50, 400]
           damping_ratio: 0.6

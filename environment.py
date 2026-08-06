@@ -379,6 +379,96 @@ class ReKepOGEnv:
         except Exception as e:
             print(f"[GRASP] diagnostic failed: {type(e).__name__}: {e}", flush=True)
 
+    def _report_stall(self, target_pose_world, tag=""):
+        """Temporary diagnostic: why does the arm stop short of a waypoint?
+
+        The OSC emits *torques*, so a stall can come from four different places and they are
+        not distinguishable from the eef error alone:
+          - a joint sitting on its position limit           -> look at the limit margins
+          - the commanded torque clipped by the motor limit -> look at effort vs effort limit
+          - something physically blocking the arm           -> look at the contact list
+          - a kinematic singularity (Jacobian rank loss)    -> look at the singular values
+        Dump all four at once.
+        """
+        try:
+            robot = self.robot
+            arm = robot.default_arm
+            names = list(robot.joints.keys())
+            dof_idx = np.concatenate([
+                T.to_numpy(robot.trunk_control_idx).astype(int),
+                T.to_numpy(robot.arm_control_idx[arm]).astype(int),
+            ])
+
+            q = T.to_numpy(robot.get_joint_positions())
+            qd = T.to_numpy(robot.get_joint_velocities())
+            lo = T.to_numpy(robot.joint_lower_limits)
+            hi = T.to_numpy(robot.joint_upper_limits)
+            eff = T.to_numpy(robot.get_joint_efforts())
+            eff_norm = T.to_numpy(robot.get_joint_efforts(normalized=True))
+
+            print(f"[STALL{tag}] ---- joint state (trunk + arm) ----", flush=True)
+            print(f"[STALL{tag}] {'joint':<22}{'pos':>9}{'lo':>9}{'hi':>9}"
+                  f"{'margin':>9}{'vel':>9}{'effort':>10}{'eff_norm':>10}", flush=True)
+            for i in dof_idx:
+                n = names[i]
+                m_lo, m_hi = q[i] - lo[i], hi[i] - q[i]
+                flag = ""
+                if min(m_lo, m_hi) < np.deg2rad(2.0):
+                    flag += "  <== AT POSITION LIMIT"
+                if abs(eff_norm[i]) > 0.98:
+                    flag += "  <== TORQUE SATURATED"
+                print(f"[STALL{tag}] {n:<22}{q[i]:>9.4f}{lo[i]:>9.4f}{hi[i]:>9.4f}"
+                      f"{min(m_lo, m_hi):>9.4f}{qd[i]:>9.4f}{eff[i]:>10.3f}{eff_norm[i]:>10.3f}{flag}",
+                      flush=True)
+
+            # --- arm Jacobian conditioning, in the robot base frame -------------------
+            # index exactly the way controllable_object.py builds the OSC's jacobian entry:
+            # rows are counted from the end, columns skip the 6 floating-base DOFs
+            jac = T.to_numpy(robot.get_relative_jacobian())
+            link_idx = robot._articulation_view.get_body_index(robot.eef_link_names[arm])
+            start = 0 if robot.fixed_base else 6
+            j_full = jac[-(robot.n_links - link_idx), :, start:start + robot.n_joints]
+            arm_idx = T.to_numpy(robot.arm_control_idx[arm]).astype(int)
+            j_eef = j_full[:, arm_idx]  # OSC only actuates the 7 arm joints
+            sv = np.linalg.svd(j_eef, compute_uv=False)
+            print(f"[STALL{tag}] jacobian singular values = {np.round(sv, 5).tolist()}", flush=True)
+            print(f"[STALL{tag}] condition number = {sv[0] / max(sv[-1], 1e-12):.1f} "
+                  f"(>1e3 means near-singular)", flush=True)
+
+            # --- what is touching the robot / the grasped object ---------------------
+            def contacts_of(entity, label):
+                pairs = set()
+                for link_name, link in entity.links.items():
+                    for c in link.contact_list():
+                        other = c.body1 if str(c.body0).startswith(entity.prim_path) else c.body0
+                        if str(other).startswith(entity.prim_path):
+                            continue  # self-contact between adjacent links, ignore
+                        pairs.add(f"{link_name} <-> {str(other)}")
+                print(f"[STALL{tag}] contacts[{label}] = {sorted(pairs) if pairs else 'NONE'}",
+                      flush=True)
+
+            contacts_of(robot, "robot")
+            in_hand = robot._ag_obj_in_hand[arm]
+            if in_hand is not None:
+                contacts_of(in_hand, in_hand.name)
+                lo_b, hi_b = (T.to_numpy(v) for v in in_hand.aabb)
+                print(f"[STALL{tag}] {in_hand.name} aabb z=[{lo_b[2]:.4f},{hi_b[2]:.4f}] "
+                      f"(tabletop is 0.6970)", flush=True)
+            else:
+                print(f"[STALL{tag}] contacts[in_hand] = NOTHING GRASPED", flush=True)
+
+            # --- how far the eef actually is, in the robot frame ---------------------
+            tgt_robot = np.dot(self.world2robot_homo, T.convert_pose_quat2mat(target_pose_world))
+            cur = T.to_numpy(robot.get_relative_eef_position())
+            print(f"[STALL{tag}] eef_robot={np.round(cur, 4).tolist()} "
+                  f"target_robot={np.round(tgt_robot[:3, 3], 4).tolist()} "
+                  f"delta={np.round(tgt_robot[:3, 3] - cur, 4).tolist()}", flush=True)
+            print(f"[STALL{tag}] ----------------------------------", flush=True)
+        except Exception as e:
+            import traceback
+            print(f"[STALL{tag}] diagnostic failed: {type(e).__name__}: {e}", flush=True)
+            traceback.print_exc()
+
     def open_gripper(self):
         if self.last_og_gripper_action == 1.0:
             return
@@ -518,7 +608,6 @@ class ReKepOGEnv:
         pos_error = np.linalg.norm(pos_diff)
         # calculate rotation delta
         rot_error = angle_between_rotmat(current_rotmat, target_rotmat)
-        print(f"[DEBUG check_reached] world_curr_pos={np.round(current_pos,4)} world_curr_quat={np.round(current_xyzw,4)} world_target_pos={np.round(target_pos,4)} world_target_quat={np.round(target_xyzw,4)}", flush=True)
         # print status
         self.verbose and print(f'{bcolors.WARNING}[environment.py | {get_clock_time()}]  Curr pose: {current_pos}, {current_xyzw} (pos_error: {pos_error.round(4)}, rot_error: {np.rad2deg(rot_error).round(4)}){bcolors.ENDC}')
         self.verbose and print(f'{bcolors.WARNING}[environment.py | {get_clock_time()}]  Goal pose: {target_pos}, {target_xyzw} (pos_thres: {pos_threshold}, rot_thres: {rot_threshold}){bcolors.ENDC}')
@@ -531,6 +620,7 @@ class ReKepOGEnv:
         pos_errors = []
         rot_errors = []
         count = 0
+        start_eef = T.to_numpy(self.robot.get_relative_eef_position())
         while count < max_steps:
             reached, pos_error, rot_error = self._check_reached_ee(target_pose_world[:3], target_pose_world[3:7], pos_threshold, rot_threshold)
             pos_errors.append(pos_error)
@@ -546,10 +636,10 @@ class ReKepOGEnv:
             relative_position = target_pose_robot[:3, 3] - rel_eef_pos
             relative_quat = T.quat_distance(target_quat_robot, rel_eef_quat)
             relative_axisangle = T.quat2axisangle(relative_quat)
-            print(f"[DEBUG waypoint] target_world_pos={np.round(target_pose_world[:3],4)} target_world_quat={np.round(target_pose_world[3:7],4)}", flush=True)
-            print(f"[DEBUG waypoint] target_robot_pos={np.round(target_pose_robot[:3,3],4)} target_robot_quat={np.round(target_quat_robot,4)}", flush=True)
-            print(f"[DEBUG waypoint] curr_rel_eef_pos={np.round(rel_eef_pos,4)} curr_rel_eef_quat={np.round(rel_eef_quat,4)}", flush=True)
-            print(f"[DEBUG waypoint] relative_position={np.round(relative_position,4)} relative_quat={np.round(relative_quat,4)} relative_axisangle={np.round(relative_axisangle,4)} |axisangle|={np.round(np.linalg.norm(relative_axisangle),4)}", flush=True)
+            if count % 10 == 0:
+                print(f"[WP {count:>3}] eef_robot={np.round(rel_eef_pos,4).tolist()} "
+                      f"cmd_dpos={np.round(relative_position,4).tolist()} "
+                      f"pos_err={pos_error:.4f} rot_err={np.rad2deg(rot_error):.2f}deg", flush=True)
             assert isinstance(self.robot, Fetch), "this action space is only for fetch"
             action = self._empty_action()  # base/trunk/camera stay at zero
             action[self.arm_action_idx[:3]] = relative_position
@@ -560,6 +650,14 @@ class ReKepOGEnv:
             count += 1
         if count == max_steps:
             print(f'{bcolors.WARNING}[environment.py | {get_clock_time()}] OSC pose not reached after {max_steps} steps (pos_error: {pos_errors[-1].round(4)}, rot_error: {np.rad2deg(rot_errors[-1]).round(4)}){bcolors.ENDC}')
+            # a real stall is "the arm barely moved at all", not just "ran out of steps":
+            # the intermediate waypoints are deliberately cut off early while still moving
+            travelled = float(np.linalg.norm(
+                T.to_numpy(self.robot.get_relative_eef_position()) - start_eef))
+            print(f'{bcolors.WARNING}[environment.py] eef travelled {travelled * 100:.2f} cm '
+                  f'over those {max_steps} steps{bcolors.ENDC}', flush=True)
+            if travelled < 0.02 or max_steps >= 60:
+                self._report_stall(target_pose_world, tag=f" {max_steps}st")
 
     def _step(self, action=None):
         if hasattr(self, 'disturbance_seq') and self.disturbance_seq is not None:
