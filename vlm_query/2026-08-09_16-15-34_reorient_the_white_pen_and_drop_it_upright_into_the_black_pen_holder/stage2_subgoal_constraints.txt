@@ -1,0 +1,9 @@
+def stage2_subgoal_constraint1(end_effector, keypoints):
+    """The white pen must be upright (parallel to the z-axis)."""
+    # Assuming the pen's upright position is defined by a specific orientation
+    # Here we can define a dummy upright position for the pen
+    upright_position = np.array([0, 0, 1])  # Example upright vector
+    current_orientation = end_effector - keypoints[0]  # Current orientation based on end-effector position
+    cost = np.dot(current_orientation, upright_position)  # Cost based on alignment with upright position
+    return cost
+

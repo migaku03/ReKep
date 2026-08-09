@@ -1,0 +1,14 @@
+def stage1_subgoal_constraint1(end_effector, keypoints):
+    """Align the end-effector with the middle of the white pen (between keypoints 0 and 1)."""
+    # HAND-CORRECTED, the second deliberate edit in this directory. gpt-4o-2024-11-20 wrote
+    # keypoints[0], but both pen keypoints sit near the ends: the pen spans y -0.287..-0.044 and
+    # keypoint 0 is 10% along it while keypoint 1 is 76% along. DINOv2 puts keypoints where
+    # features are distinctive, which is the ends, never the middle. Grasping either one holds a
+    # 24 cm pen by its tip, which is a long lever for the arm and forces the gripper down to the
+    # holder's rim height in stage 3, where keypoint 0 has to end up. Their midpoint lands at 42%
+    # -- near the centre of mass -- and leaves keypoint 0 hanging safely below the gripper.
+    # output_raw.txt is left untouched as the record of what the model said.
+    grasp_point = (keypoints[0] + keypoints[1]) / 2
+    cost = np.linalg.norm(end_effector - grasp_point)
+    return cost
+

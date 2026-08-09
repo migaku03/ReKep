@@ -18,14 +18,17 @@ class ConstraintGenerator:
         self.config = config
         self.client = OpenAI(api_key=os.environ['OPENAI_API_KEY'])
         self.base_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), './vlm_query')
-        with open(os.path.join(self.base_dir, 'prompt_template.txt'), 'r') as f:
+        # every open() here is pinned to utf-8: the default on Windows is cp932, and a single
+        # curly quote or arrow in the model's response is enough to make the output_raw.txt
+        # write below raise UnicodeEncodeError -- losing a response that has already been paid for
+        with open(os.path.join(self.base_dir, 'prompt_template.txt'), 'r', encoding='utf-8') as f:
             self.prompt_template = f.read()
 
     def _build_prompt(self, image_path, instruction):
         img_base64 = encode_image(image_path)
         prompt_text = self.prompt_template.format(instruction=instruction)
         # save prompt
-        with open(os.path.join(self.task_dir, 'prompt.txt'), 'w') as f:
+        with open(os.path.join(self.task_dir, 'prompt.txt'), 'w', encoding='utf-8') as f:
             f.write(prompt_text)
         messages = [
             {
@@ -67,7 +70,7 @@ class ConstraintGenerator:
             groupings[key].append(name)
         # save them into files
         for key in groupings:
-            with open(os.path.join(save_dir, f"{key}_constraints.txt"), "w") as f:
+            with open(os.path.join(save_dir, f"{key}_constraints.txt"), "w", encoding='utf-8') as f:
                 for name in groupings[key]:
                     f.write("\n".join(functions[name]) + "\n\n")
         print(f"Constraints saved to {save_dir}")
@@ -113,7 +116,7 @@ class ConstraintGenerator:
         for k, v in metadata.items():
             if isinstance(v, np.ndarray):
                 metadata[k] = v.tolist()
-        with open(os.path.join(self.task_dir, 'metadata.json'), 'w') as f:
+        with open(os.path.join(self.task_dir, 'metadata.json'), 'w', encoding='utf-8') as f:
             json.dump(metadata, f)
         print(f"Metadata saved to {os.path.join(self.task_dir, 'metadata.json')}")
 
@@ -148,7 +151,7 @@ class ConstraintGenerator:
                 output += chunk.choices[0].delta.content
         print(f'[{time.time()-start:.2f}s] Querying OpenAI API...Done')
         # save raw output
-        with open(os.path.join(self.task_dir, 'output_raw.txt'), 'w') as f:
+        with open(os.path.join(self.task_dir, 'output_raw.txt'), 'w', encoding='utf-8') as f:
             f.write(output)
         # parse and save constraints
         self._parse_and_save_constraints(output, self.task_dir)

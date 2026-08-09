@@ -9,3 +9,13 @@ pip_*log.txt
 *.bak
 .vscode/
 videos/
+
+# tools/propose_keypoints.py output: one directory per run, regenerable for free
+keypoint_proposals/
+
+# vlm_query/ is deliberately NOT ignored, but it is not a dumping ground either: each query
+# directory carries a ~208 KB query_img.png, so add one only when the run is worth keeping --
+# a paid response whose content some conclusion rests on, or a constraint set something was
+# actually executed against. Plumbing rehearsals that nothing cites can be deleted instead.
+# (Copies of one proposal image cost nothing extra, since git stores blobs by content; a *new*
+# Phase 1 proposal is what adds another 208 KB.)

@@ -58,6 +58,11 @@ env:
           kp: 250
           kp_limits: [50, 400]
           damping_ratio: 0.6
+          # kp_null is left at the OSC default of 10. Raising it to 40 was tried while chasing
+          # the trunk pinning at its 0.3862 stop: it did pull the arm back toward the holder
+          # instead of away from it, but it simply moved the pinning to the other end (trunk at
+          # 0.0000 seven times, wrist_roll wound to -6.2832), so it is not a fix on its own. It
+          # belongs with a wider retune of the execution layer, not on its own.
         gripper_0:
           name: MultiFingerGripperController
           command_input_limits: [0.0, 1.0]
