@@ -5,6 +5,21 @@ main:
   interpolate_pos_step_size: &interpolate_pos_step_size 0.05  # controls the density of the final returned path
   interpolate_rot_step_size: &interpolate_rot_step_size 0.34  # about 20 degrees
   grasp_depth: 0.10
+  # Which local axis of the eef frame the grasp advances along, and how far back the pregrasp
+  # standoff sits as a fraction of grasp_depth. 'x' / 0.5 is upstream ReKep, bit for bit.
+  #
+  # These two are coupled and must be read together. Upstream backs off grasp_depth/2 and then
+  # advances grasp_depth, so the gripper ends grasp_depth/2 past the pose the solver returned.
+  # Along local X that overshoot runs along the pen's long axis and is harmless. Along local Z --
+  # the actual approach axis, which subgoal_solver.py:71 already optimises for -- it drives the
+  # gripper grasp_depth/2 into the tabletop. Measured: localZ->world = [-0.021, 0.168, -0.986]
+  # (straight down) while localX->world = [0.276, -0.947, -0.167] (nearly horizontal), so the
+  # 10 cm advance currently moves the gripper 9.5 cm sideways and only 1.7 cm down.
+  #
+  # Setting axis to 'z' with ratio 1.0 makes standoff and advance cancel, so the gripper lands
+  # exactly on the solved pose while approaching from above.
+  grasp_approach_axis: x
+  grasp_standoff_ratio: 0.5
   constraint_tolerance: 0.10  # for backtracking
   bounds_min: &bounds_min [-0.45, -0.75, 0.698]
   bounds_max: &bounds_max [0.10, 0.60, 1.2]
@@ -58,6 +73,36 @@ env:
           kp: 250
           kp_limits: [50, 400]
           damping_ratio: 0.6
+          # LEAVE THIS AT 0.0 FOR ANY RUN THAT IS MEANT TO BE "ReKep".
+          #
+          # lambda_damping is a parameter this project ADDED to OmniGibson's
+          # OperationalSpaceController (patches/omnigibson_osc_damped_least_squares.patch), which
+          # otherwise computes inv(J M^-1 J^T) with no regularisation whatsoever. That is verified
+          # identical in cc0316a05, the commit upstream ReKep was written against -- so upstream
+          # ReKep ran undamped, and a damped run is not a run of ReKep. It belongs in its own row
+          # next to vlm_query/pen_upright_fixed, not folded into the baseline. See chapter 18.
+          #
+          # What it was for: at elbow_flex = 0 Fetch's upperarm_roll and forearm_roll axes are both
+          # (1,0,0) with only x-offsets between them, so they lie on the same line and the Jacobian
+          # loses exactly one rank (measured fix4: elbow_flex = 0.0006, sigma_min = 8.0e-05,
+          # cond = 22332, at 0.567 m of a ~0.97 m reach -- an INTERIOR singularity, so moving the
+          # robot or the table does not avoid it).
+          #
+          # What the one damped run actually showed (damp1, SUCCESS, best miss so far at 2.66 cm):
+          # the stall became a complete standstill instead of a wrong-direction drift, but
+          # elbow_flex stayed at 0.0119 and wrist_flex pinned harder (margin 0.0000 vs 0.0023).
+          # So the wrist pinning is configuration-driven, not control-driven. Damping did not fix
+          # it and was never going to.
+          #
+          # And the reason this is not the priority: condition number does not predict outcome.
+          # run7 FAILED at cond 8.8 and 10.4; fix4 SUCCEEDED at cond 22332. What separates the
+          # runs is torso_lift_joint hitting its 0.3862 stop (failures 2/2, stalling successes
+          # 0/3). Chase that, not the singularity.
+          #
+          # If you do turn it on: 0.032 means lambda^2 = 1e-3, which moves the healthy eigenvalues
+          # of J M^-1 J^T (O(0.09-2.0)) by <1.2% while taking the degenerate one from 3.6e-09 to
+          # 1.0e-03. Results are flat over lambda in [0.01, 0.1], so it is not a tuned number.
+          lambda_damping: 0.0
           # kp_null is left at the OSC default of 10. Raising it to 40 was tried while chasing
           # the trunk pinning at its 0.3862 stop: it did pull the arm back toward the holder
           # instead of away from it, but it simply moved the pinning to the other end (trunk at

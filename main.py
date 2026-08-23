@@ -245,11 +245,18 @@ class Main:
         subgoal_pose_homo = T.convert_pose_quat2mat(subgoal_pose)
         # if grasp stage, back up a bit to leave room for grasping.
         #
-        # Local X here is upstream's, and it is kept deliberately -- see the long note in
-        # _execute_grasp_action. It disagrees with subgoal_solver.py:71, which we did change to
-        # local Z, and the two together are the reason this line looks wrong and is left alone.
+        # Upstream backs off by grasp_depth/2 here and advances by grasp_depth in
+        # _execute_grasp_action, so the gripper lands grasp_depth/2 PAST the pose the solver
+        # actually returned. Along upstream's local X that overshoot slides along the pen's long
+        # axis and is harmless (arguably deliberate: it seats the pen between the fingers). Along
+        # local Z -- the real approach axis, see subgoal_solver.py:71 -- the same overshoot drives
+        # the gripper into the tabletop. See config.yaml grasp_approach_axis / grasp_standoff_ratio.
         if self.is_grasp_stage:
-            subgoal_pose[:3] += subgoal_pose_homo[:3, :3] @ np.array([-self.config['grasp_depth'] / 2.0, 0, 0])
+            _col = {'x': 0, 'z': 2}[self.config.get('grasp_approach_axis', 'x')]
+            _ratio = self.config.get('grasp_standoff_ratio', 0.5)
+            _standoff = np.zeros(3)
+            _standoff[_col] = -self.config['grasp_depth'] * _ratio
+            subgoal_pose[:3] += subgoal_pose_homo[:3, :3] @ _standoff
         debug_dict['stage'] = self.stage
         print_opt_debug_dict(debug_dict)
         if self.visualize:
@@ -342,13 +349,19 @@ class Main:
         # ik_cost carries weight 20.0 against init_pose_cost's 1.0, so the planner will trade
         # large backward motions for slightly easier IK, and nothing corrects the drift on the
         # next iteration. Recorded rather than attempted.
-        grasp_pose[:3] += T.quat2mat(pregrasp_pose[3:]) @ np.array([self.config['grasp_depth'], 0, 0])
+        _axis = self.config.get('grasp_approach_axis', 'x')
+        _col = {'x': 0, 'z': 2}[_axis]
+        _advance = np.zeros(3)
+        _advance[_col] = self.config['grasp_depth']
+        grasp_pose[:3] += T.quat2mat(pregrasp_pose[3:]) @ _advance
         # [GRASP AXES] stays: it is what settled the above, and it fires once per grasp.
         _R = T.quat2mat(pregrasp_pose[3:])
-        print(f"[GRASP AXES] pregrasp={np.round(pregrasp_pose[:3], 4)} "
+        _ratio = self.config.get('grasp_standoff_ratio', 0.5)
+        print(f"[GRASP AXES] axis={_axis} standoff_ratio={_ratio} "
+              f"net_overshoot={self.config['grasp_depth'] * (1.0 - _ratio):.4f} "
+              f"pregrasp={np.round(pregrasp_pose[:3], 4)} "
               f"localX->world={np.round(_R[:, 0], 3)} localZ->world={np.round(_R[:, 2], 3)} "
-              f"applied_delta={np.round(grasp_pose[:3] - pregrasp_pose[:3], 4)} "
-              f"(z-axis version would be {np.round(_R[:, 2] * self.config['grasp_depth'], 4)})",
+              f"applied_delta={np.round(grasp_pose[:3] - pregrasp_pose[:3], 4)}",
               flush=True)
         grasp_action = np.concatenate([grasp_pose, [self.env.get_gripper_close_action()]])
         # precise=True is required, not merely tidy. The advance is deliberately aimed *through*
