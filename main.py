@@ -222,6 +222,7 @@ class Main:
                     # if completed, save video and return
                     if self.stage == self.program_info['num_stages']:
                         self.env.sleep(2.0)
+                        self.env.report_step_timing()  # [STEP TIMING] chapter 20, remove with ch.7
                         self._report_outcome()
                         save_path = self.env.save_video()
                         print(f"{bcolors.OKGREEN}Video saved to {save_path}\n\n{bcolors.ENDC}")
@@ -297,6 +298,7 @@ class Main:
         return ee_action_seq
 
     def _update_stage(self, stage):
+        self.env.report_step_timing(tag=f'entering stage {stage}')  # [STEP TIMING] ch.20
         # update stage
         self.stage = stage
         self.is_grasp_stage = self.program_info['grasp_keypoints'][self.stage - 1] != -1

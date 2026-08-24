@@ -1,4 +1,5 @@
 import time
+import atexit
 import numpy as np
 import torch as th
 import os
@@ -91,6 +92,20 @@ APPEARANCE_OVERRIDES = {
 class ReKepOGEnv:
     def __init__(self, config, scene_file, verbose=False):
         self.video_cache = []
+        # [STEP TIMING] investigation-only instrumentation (chapter 20; listed for deletion in
+        # chapter 7). Three disjoint segments cover every microsecond from the first _step()
+        # entry to the last _step() exit, so their sum is a checksum against the wall clock:
+        #   sim -- og_env.step()/og.sim.step(): physics + rendering. Budget 1/action_frequency.
+        #   cam -- get_cam_obs() + video_cache: the per-step GPU->CPU readback, which upstream
+        #          runs on EVERY step and which is not part of the simulator's own cost.
+        #   gap -- the interval between two _step() calls, i.e. everything OUTSIDE the sim.
+        #          The subgoal/path solvers live here; the sim is not advancing at all.
+        # Nothing below touches control flow, the action, or the call order.
+        self._t_sim, self._t_cam, self._t_gap = [], [], []
+        self._t_step_exit = None
+        self._t_first_enter = None
+        self._t_timing_reported = False
+        atexit.register(self.report_step_timing)
         self.config = config
         self.verbose = verbose
         self.config['scene']['scene_file'] = scene_file
@@ -736,12 +751,19 @@ class ReKepOGEnv:
                 self._report_stall(target_pose_world, tag=f" {max_steps}st")
 
     def _step(self, action=None):
+        _t_enter = time.perf_counter()  # [STEP TIMING]
+        if self._t_step_exit is None:
+            self._t_first_enter = _t_enter
+        else:
+            self._t_gap.append(_t_enter - self._t_step_exit)
         if hasattr(self, 'disturbance_seq') and self.disturbance_seq is not None:
             next(self.disturbance_seq)
+        _t0 = time.perf_counter()  # [STEP TIMING]
         if action is not None:
             self.og_env.step(action)
         else:
             og.sim.step()
+        _t1 = time.perf_counter()  # [STEP TIMING]
         cam_obs = self.get_cam_obs()
         rgb = cam_obs[1]['rgb']
         if len(self.video_cache) < self.config['video_cache_size']:
@@ -750,6 +772,51 @@ class ReKepOGEnv:
             self.video_cache.pop(0)
             self.video_cache.append(rgb)
         self.step_counter += 1
+        _t2 = time.perf_counter()  # [STEP TIMING]
+        self._t_sim.append(_t1 - _t0)
+        self._t_cam.append(_t2 - _t1)
+        self._t_step_exit = _t2
+
+    def report_step_timing(self, tag='final'):
+        """[STEP TIMING] cumulative summary of where the wall clock went. See __init__.
+
+        Investigation-only. Called at every stage transition as well as at the end, because the
+        4-minute cap kills the process outright and atexit does not run then -- a killed run
+        must still leave usable data. Safe with no steps recorded, and the 'final' report is
+        emitted at most once so the atexit hook cannot duplicate it.
+        """
+        if not self._t_sim:
+            return
+        if tag == 'final':
+            if getattr(self, '_t_timing_reported', True):
+                return
+            self._t_timing_reported = True
+        budget = 1.0 / float(self.config['og_sim']['action_frequency'])
+        print(f'{bcolors.OKBLUE}[STEP TIMING] ---- cumulative @ {tag} ----{bcolors.ENDC}',
+              flush=True)
+        print(f'[STEP TIMING] sim budget = {budget * 1000:.1f} ms '
+              f'(action_frequency {self.config["og_sim"]["action_frequency"]} Hz)', flush=True)
+        for label, xs in (('sim', self._t_sim), ('cam', self._t_cam), ('gap', self._t_gap)):
+            if not xs:
+                continue
+            a = np.asarray(xs, dtype=float)
+            print(f'[STEP TIMING] {label:<4} n={a.size:<6d} total={a.sum():8.2f}s  '
+                  f'med={np.median(a) * 1000:8.2f}ms  p95={np.percentile(a, 95) * 1000:9.2f}ms  '
+                  f'max={a.max() * 1000:10.2f}ms', flush=True)
+        sim = np.asarray(self._t_sim, dtype=float)
+        over = sim > budget
+        print(f'[STEP TIMING] sim over budget: {int(over.sum())} / {sim.size} steps '
+              f'({100.0 * over.mean():.1f}%), excess total={float((sim[over] - budget).sum()):.2f}s',
+              flush=True)
+        if self._t_gap:
+            gap = np.asarray(self._t_gap, dtype=float)
+            big = gap > 1.0
+            print(f'[STEP TIMING] gap > 1.0 s: {int(big.sum())} times, '
+                  f'total={float(gap[big].sum()):.2f}s  (this is the frozen-sim time)', flush=True)
+        total = sim.sum() + float(np.sum(self._t_cam)) + float(np.sum(self._t_gap))
+        covered = self._t_step_exit - self._t_first_enter
+        print(f'[STEP TIMING] checksum: segments={total:.2f}s vs first-enter..last-exit='
+              f'{covered:.2f}s  (diff {abs(total - covered):.3f}s)', flush=True)
 
     def _initialize_cameras(self, cam_config):
         """
