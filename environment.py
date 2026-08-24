@@ -764,8 +764,10 @@ class ReKepOGEnv:
         else:
             og.sim.step()
         _t1 = time.perf_counter()  # [STEP TIMING]
-        cam_obs = self.get_cam_obs()
-        rgb = cam_obs[1]['rgb']
+        # Tier 1 cam-readback fix (docs/behavior1k_rekep_setup.md 20.11): _step() only ever
+        # needs cam_1's rgb for the video cache, but get_cam_obs() unconditionally computes
+        # rgb/depth/points/seg for BOTH cameras every step. get_rgb_obs() fetches just this.
+        rgb = self.cams[1].get_rgb_obs()
         if len(self.video_cache) < self.config['video_cache_size']:
             self.video_cache.append(rgb)
         else:

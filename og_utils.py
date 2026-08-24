@@ -2,11 +2,16 @@ from omnigibson.sensors.vision_sensor import VisionSensor
 import transform_utils as T
 import numpy as np
 
+
+def _to_numpy(x):
+    return x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
+
+
 class OGCamera:
     """
     Defines the camera class
     """
-    def __init__(self, og_env, config) -> None:        
+    def __init__(self, og_env, config) -> None:
         self.cam = insert_camera(name=config['name'], og_env=og_env, width=config['resolution'], height=config['resolution'])
         self.cam.set_position_orientation(config['position'], config['orientation'])
         self.intrinsics = get_cam_intrinsics(self.cam)
@@ -17,7 +22,7 @@ class OGCamera:
         Get the intrinsic and extrinsic parameters of the camera
         """
         return {"intrinsics": self.intrinsics, "extrinsics": self.extrinsics}
-    
+
     def get_obs(self):
         """
         Gets the image observation from the camera.
@@ -25,8 +30,6 @@ class OGCamera:
         No semantic handling here for now.
         """
         obs = self.cam.get_obs()
-        def _to_numpy(x):
-            return x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
         ret = {}
         ret["rgb"] = _to_numpy(obs[0]["rgb"])[:,:,:3]  # H, W, 3
         ret["depth"] = _to_numpy(obs[0]["depth_linear"])  # H, W
@@ -35,6 +38,17 @@ class OGCamera:
         ret["intrinsic"] = self.intrinsics
         ret["extrinsic"] = self.extrinsics
         return ret
+
+    def get_rgb_obs(self):
+        """Cheap accessor for ReKepOGEnv._step()'s per-step video-cache hot path.
+
+        Skips the depth/seg _to_numpy() conversions and the pixel_to_3d_points() reprojection
+        that get_obs() always performs and that _step() never reads. get_obs() itself is
+        unchanged and remains the full-fidelity contract used by main.py,
+        tools/propose_keypoints.py, and visualizer.py.
+        """
+        obs = self.cam.get_obs()
+        return _to_numpy(obs[0]["rgb"])[:, :, :3]
 
 def insert_camera(name, og_env, width=480, height=480):
     try:
