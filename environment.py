@@ -542,7 +542,8 @@ class ReKepOGEnv:
             eff = T.to_numpy(robot.get_joint_efforts())
             eff_norm = T.to_numpy(robot.get_joint_efforts(normalized=True))
 
-            print(f"[STALL{tag}] ---- joint state (trunk + arm) ----", flush=True)
+            _planned = "trunk + arm" if len(dof_idx) > len(robot.arm_control_idx[arm]) else "arm"
+            print(f"[STALL{tag}] ---- joint state ({_planned}) ----", flush=True)
             print(f"[STALL{tag}] {'joint':<22}{'pos':>9}{'lo':>9}{'hi':>9}"
                   f"{'margin':>9}{'vel':>9}{'effort':>10}{'eff_norm':>10}", flush=True)
             for i in dof_idx:
@@ -565,7 +566,7 @@ class ReKepOGEnv:
             start = 0 if robot.fixed_base else 6
             j_full = jac[-(robot.n_links - link_idx), :, start:start + robot.n_joints]
             arm_idx = T.to_numpy(robot.arm_control_idx[arm]).astype(int)
-            j_eef = j_full[:, arm_idx]  # OSC only actuates the 7 arm joints
+            j_eef = j_full[:, arm_idx]  # only the joints the arm controller actuates
             sv = np.linalg.svd(j_eef, compute_uv=False)
             print(f"[STALL{tag}] jacobian singular values = {np.round(sv, 5).tolist()}", flush=True)
             print(f"[STALL{tag}] condition number = {sv[0] / max(sv[-1], 1e-12):.1f} "

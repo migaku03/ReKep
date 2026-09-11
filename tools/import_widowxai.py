@@ -43,11 +43,70 @@ import shutil
 import sys
 
 
+def _patch_single_xform_prim():
+    """Point `XFormPrim(prim_path=...)` at the class that still takes a single prim_path.
+
+    add_sensor() constructs `lazy.isaacsim.core.prims.xform_prim.XFormPrim(prim_path=...)` twice.
+    In Isaac Sim 4.5 that name is the *batched* view class and takes `prim_paths_expr`; the
+    single-prim class it used to be was split out as `SingleXFormPrim`. So:
+
+        TypeError: XFormPrim.__init__() got an unexpected keyword argument 'prim_path'
+
+    Only calls that pass `prim_path` are redirected -- anything using the batched signature still
+    reaches the real class. Has to be applied after og.launch(), since isaacsim cannot be
+    imported before the simulator boots, which is why this is not done up front with the others.
+    """
+    # Reached by attribute, not by import. `isaacsim.core.prims` does `from .impl import *`, which
+    # copies the *name* xform_prim into the package namespace without making
+    # `isaacsim.core.prims.xform_prim` an importable module path -- so `import` raises
+    # ModuleNotFoundError on the very path the example script successfully attribute-walks
+    # through `lazy`. Walk it the same way it does.
+    import isaacsim.core.prims as prims
+
+    SingleXFormPrim = prims.SingleXFormPrim
+    module = prims.xform_prim
+
+    original = module.XFormPrim
+
+    class _Shim:
+        """Callable stand-in that redirects prim_path= calls and proxies everything else.
+
+        It cannot simply be a function. `SingleXFormPrim.__init__` delegates to
+        `XFormPrim.__init__`, which reaches back through its own module global to call
+        `XFormPrim.set_local_poses(...)` -- so replacing the name with a function breaks the
+        real class from the inside:
+
+            AttributeError: 'function' object has no attribute 'set_local_poses'
+
+        Forwarding attribute lookups to the original class keeps those internal class-level
+        references working while still intercepting construction.
+        """
+
+        def __call__(self, *args, **kwargs):
+            if "prim_path" in kwargs:
+                return SingleXFormPrim(*args, **kwargs)
+            return original(*args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(original, name)
+
+    module.XFormPrim = _Shim()
+
+
 def _patched_importer(dataset_root):
-    """Return `import_og_asset_from_urdf` with @dataset_root bound, keeping the rest as-is."""
+    """`import_og_asset_from_urdf` with @dataset_root bound, patching Isaac's API on the way out.
+
+    The eef/camera link creation that runs after this returns needs the XFormPrim fix, and that
+    fix needs a booted simulator -- which this call is what provides.
+    """
     from omnigibson.utils.asset_conversion_utils import import_og_asset_from_urdf
 
-    return functools.partial(import_og_asset_from_urdf, dataset_root=dataset_root)
+    def run(*args, **kwargs):
+        result = import_og_asset_from_urdf(*args, dataset_root=dataset_root, **kwargs)
+        _patch_single_xform_prim()
+        return result
+
+    return run
 
 
 def _patch_convert_urdf_to_usd():
