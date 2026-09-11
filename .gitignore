@@ -19,3 +19,8 @@ keypoint_proposals/
 # actually executed against. Plumbing rehearsals that nothing cites can be deleted instead.
 # (Copies of one proposal image cost nothing extra, since git stores blobs by content; a *new*
 # Phase 1 proposal is what adds another 208 KB.)
+
+# CoACD output, written back next to the vendored source meshes by the importer because mesh
+# paths in the URDF resolve relative to it. Derived, not source: regenerate with
+#   python tools/import_widowxai.py --config assets/widowxai/widowxai_source_config.yaml
+assets/widowxai/meshes/collision/
