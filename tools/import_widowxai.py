@@ -130,8 +130,19 @@ def _patch_convert_urdf_to_usd():
     acu.convert_urdf_to_usd = shim
 
 
-def install(name, data_path):
-    """Move the importer's output into the location robot_base.py actually reads."""
+def install(name, data_path, urdf_src=None):
+    """Move the importer's output into the location robot_base.py actually reads.
+
+    Also places a URDF, which the importer does not. `robot_base.py` exposes
+    `urdf_path` as `models/<name>/urdf/<name>.urdf`, and ReKep hands exactly that to lula when it
+    builds the IK solver for its reachability cost -- so without it the robot loads fine and then
+    main.py dies constructing the solver. Every shipped robot has this directory; vx300s keeps
+    its meshes under `urdf/meshes/`, and the source URDF's mesh references are already relative
+    in that shape, so copying the pair across preserves them.
+
+    The URDF copied is the source one, not the collision-decomposed variant the conversion
+    produced. lula reads it only for the kinematic chain.
+    """
     src = os.path.join(data_path, "custom_dataset", "objects", "robot", name)
     dst = os.path.join(data_path, "omnigibson-robot-assets", "models", name)
     if not os.path.isdir(src):
@@ -141,6 +152,16 @@ def install(name, data_path):
         raise SystemExit(f"refusing to overwrite existing {dst} -- remove it first if that is what you want")
     print(f"installing {src}\n        -> {dst}")
     shutil.copytree(src, dst)
+
+    if urdf_src is not None:
+        urdf_dir = os.path.join(dst, "urdf")
+        os.makedirs(urdf_dir, exist_ok=True)
+        shutil.copy(urdf_src, os.path.join(urdf_dir, f"{name}.urdf"))
+        meshes_src = os.path.join(os.path.dirname(urdf_src), "meshes")
+        if os.path.isdir(meshes_src):
+            shutil.copytree(meshes_src, os.path.join(urdf_dir, "meshes"))
+        print(f"  placed urdf/{name}.urdf (+ meshes) for the IK solver")
+
     for entry in sorted(os.listdir(dst)):
         print(f"  {entry}")
     return dst
@@ -159,7 +180,9 @@ def main(argv=None):
 
     import yaml
     with open(args.config, "r") as f:
-        name = yaml.safe_load(f)["name"]
+        cfg = yaml.safe_load(f)
+    name = cfg["name"]
+    urdf_src = os.path.abspath(cfg["urdf_path"])
 
     if not args.install_only:
         dataset_root = os.path.join(gm.DATA_PATH, "custom_dataset")
@@ -177,7 +200,7 @@ def main(argv=None):
         importer.import_custom_robot.callback(config=args.config)
 
     if args.install or args.install_only:
-        install(name, gm.DATA_PATH)
+        install(name, gm.DATA_PATH, urdf_src=urdf_src)
     return 0
 
 

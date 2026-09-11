@@ -51,15 +51,20 @@ eef_vis_links:
       position: [0.156062, 0.0, 0.0]      # same offset as the URDF's ee_gripper joint
       orientation: [0.7071068, 0.0, 0.7071068, 0.0]   # (x,y,z,w)
 
-# The real arm carries an Intel RealSense D405 on the wrist, so the simulated one should too.
-# ReKep itself never reads it -- it uses two world-fixed cameras -- so the pose below is derived
-# from the frame conventions rather than confirmed visually. See README.md "Not verified".
-camera_links:
-  - link: eyes
-    parent_link: camera_link
-    offset:
-      position: [0.0, 0.0, 0.0]
-      orientation: [0.5, -0.5, -0.5, 0.5]   # ROS camera_link (x fwd, z up) -> Isaac (-z fwd, y up)
+# The real arm carries an Intel RealSense D405 on the wrist, and the simulated one eventually
+# should too -- but not during bring-up. ReKep never reads the robot's onboard camera; it uses
+# two world-fixed cameras (cam_0 for the VLM, cam_1 to record). Meanwhile the importer's Camera
+# branch is the only one that calls og.sim.render() mid-conversion, and this machine's headless
+# viewport is already throwing "/World/viewer_camera is not a valid UsdGeom.Camera" -- so it is
+# the one step most likely to hang a run that costs ~20 minutes of CoACD to reach.
+#
+# Left empty on purpose, with the derived pose kept here for when it is wanted:
+#     - link: eyes
+#       parent_link: camera_link
+#       offset:
+#         position: [0.0, 0.0, 0.0]
+#         orientation: [0.5, -0.5, -0.5, 0.5]  # ROS camera_link (x fwd, z up) -> Isaac (-z fwd, y up)
+camera_links: []
 
 lidar_links: []
 
