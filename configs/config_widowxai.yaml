@@ -74,9 +74,23 @@ env:
       obs_modalities: [rgb, depth]
       action_modalities: continuous
       action_normalize: False
-      # Fetch stands at [-0.8, 0, 0] and drives its torso up to the table. This arm is bolted
-      # down, so it has to start at working height. Placeholder pending the task-layout work.
-      position: [-0.35, 0.0, 0.698]
+      # Fetch stands on the floor at [-0.8, 0, 0] and drives its torso up to the table. This arm
+      # is bolted down, so it has to be mounted *on* the table, and where is not free:
+      #
+      #   table footprint   x in [-0.364, 0.631], y in [-1.216, 1.172]   (bmnubh, scale 2)
+      #   pen_1             [-0.263, -0.176, 0.709]
+      #   pencil_holder_1   [-0.300,  0.150, 0.751]
+      #
+      # Both objects sit within 10 cm of the table's -x edge, so there is no room to mount behind
+      # them. Mounting at +x instead puts them 0.45-0.48 m away, comfortably inside the 0.7 m
+      # rated reach and well outside the folded-in zone -- but it also puts them *behind* the
+      # arm, because the arm's forward direction is its own +x. Rotating the waist to compensate
+      # is not an option: joint_0's travel is +/-3.0543 rad = +/-175 deg, so a 180 deg turn is
+      # just outside it. Hence the yaw below rather than a bigger joint_0 command.
+      position: [0.15, 0.0, 0.69]
+      orientation: [0.0, 0.0, 1.0, 0.0]   # (x,y,z,w) -- 180 deg yaw, so local +x faces world -x
+      # z is the table top, taken from chapter 16.4's measured pen bottom (0.6993) and holder
+      # floor (0.6913). Confirm against the AABB lines environment.py prints at startup.
       # Required by ReKep: get_sdf_voxels() reads _ag_obj_in_hand to keep the carried object out
       # of the scene SDF, and environment.py asserts the mode is assisted or sticky.
       grasping_mode: assisted
