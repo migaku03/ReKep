@@ -1,0 +1,67 @@
+# Source config for OmniGibson's importer:
+#
+#   cd external/ReKep
+#   python <OmniGibson>/omnigibson/examples/robots/import_custom_robot.py \
+#       --config assets/widowxai/widowxai_source_config.yaml
+#
+# Output lands in <gm.DATA_PATH>/custom_dataset/objects/robot/widowxai and has to be moved to
+# <gm.DATA_PATH>/omnigibson-robot-assets/models/widowxai, which is where robot_base.py:626
+# looks (models/<lowercased class name>/usd/<same>.usda).
+#
+# Every non-obvious value here is justified in README.md next to this file.
+
+urdf_path: assets/widowxai/wxai_follower.urdf   # relative to the ReKep repo root; run from there
+name: widowxai                                  # -> class WidowXAI, models/widowxai/...
+headless: true
+overwrite: true
+
+# MUST stay false. Merging fixed joints would fold gripper_left/gripper_right into the carriages
+# and ee_gripper_link into link_6, and the robot class needs to name all three.
+merge_fixed_joints: false
+
+# Fixed base: no wheels, no holonomic joints. Listed explicitly rather than omitted so that
+# "this robot does not move its base" is a statement in the file rather than an absence.
+base_motion:
+  wheel_links: []
+  wheel_joints: []
+  use_sphere_wheels: false
+  use_holonomic_joints: false
+
+collision:
+  # CoACD, not convex hulls. The URDF reuses the render meshes as collision meshes and those
+  # meshes are markedly concave -- measured volume/hull ratios run 0.28 to 0.56 -- so convex
+  # hulls would fatten every link and, worse, fill in the recess of the finger pads that the
+  # grasp depends on. See README.md.
+  decompose_method: coacd
+  hull_count: 8
+  coacd_links: []
+  convex_links:
+    - base_link      # ratio 0.78, and it is bolted to the world; a hull costs nothing here
+  no_decompose_links: []
+  no_collision_links: []   # camera_link's collision is already a box primitive in the URDF
+
+# Rotates the end-effector frame into OmniGibson's convention (z out of the fingertips, y from
+# the left finger to the right) without moving its origin. The URDF's own ee_gripper_link puts
+# the approach on x instead, which would silently invalidate the column index that chapter 11
+# fixed in subgoal_solver.py. Derivation in README.md.
+eef_vis_links:
+  - link: eef_link
+    parent_link: link_6
+    offset:
+      position: [0.156062, 0.0, 0.0]      # same offset as the URDF's ee_gripper joint
+      orientation: [0.7071068, 0.0, 0.7071068, 0.0]   # (x,y,z,w)
+
+# The real arm carries an Intel RealSense D405 on the wrist, so the simulated one should too.
+# ReKep itself never reads it -- it uses two world-fixed cameras -- so the pose below is derived
+# from the frame conventions rather than confirmed visually. See README.md "Not verified".
+camera_links:
+  - link: eyes
+    parent_link: camera_link
+    offset:
+      position: [0.0, 0.0, 0.0]
+      orientation: [0.5, -0.5, -0.5, 0.5]   # ROS camera_link (x fwd, z up) -> Isaac (-z fwd, y up)
+
+lidar_links: []
+
+# No curobo block. CuRobo drives OmniGibson's action primitives, which ReKep does not use --
+# it runs its own subgoal/path solvers. Omitting it skips that generation step entirely.

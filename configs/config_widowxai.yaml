@@ -1,0 +1,152 @@
+# ReKep on the Trossen WidowX AI Follower -- the arm this research will use on hardware.
+#
+#   python main.py --use_cached_query --config ./configs/config_widowxai.yaml
+#
+# A separate file rather than an edit to config.yaml, so the Fetch setup that every result in
+# chapters 1-20 was measured on stays byte-identical and both robots can be run from the same
+# checkout. Everything below that is not robot-dependent is copied from config.yaml unchanged;
+# the robot block and the `ik` block are the real content. Rationale for the choices is in
+# docs/sim_platform_decision.md and assets/widowxai/README.md.
+#
+# Status: this config is for bring-up. It gets the robot loaded and ReKep running. The task
+# layout is still the one authored for Fetch -- a mobile base with a lifting torso -- and has NOT
+# been re-designed for a bolted-down 0.7 m arm, so the pen task is not expected to succeed yet.
+
+device: &device 'cuda'
+seed: &seed 0
+
+main:
+  interpolate_pos_step_size: &interpolate_pos_step_size 0.05
+  interpolate_rot_step_size: &interpolate_rot_step_size 0.34  # about 20 degrees
+  grasp_depth: 0.10
+
+  # Unlike Fetch, this robot's approach axis is expected to land on the eef frame's z column,
+  # because the imported eef_link is built to OmniGibson's convention (z out of the fingertips)
+  # rather than inherited from the URDF's x-forward ee_gripper_link. 'z' with ratio 1.0 makes the
+  # pregrasp standoff and the grasp advance cancel, so the gripper lands exactly on the pose the
+  # solver returned while approaching from above -- which is the behaviour chapter 11 wanted and
+  # could not have on Fetch.
+  #
+  # VERIFY THIS BEFORE TRUSTING IT. Print the columns of get_ee_pose()'s rotation matrix on the
+  # loaded robot and confirm column 2 points out of the fingertips. The URDF says one thing; what
+  # the conversion produced is a separate question. See assets/widowxai/README.md.
+  grasp_approach_axis: z
+  grasp_standoff_ratio: 1.0
+
+  constraint_tolerance: 0.10  # for backtracking
+  # Workspace box. Still the Fetch numbers; re-deriving these for a fixed base whose kinematic
+  # reach is 0.833 m is part of the task-layout work that has not been done yet.
+  bounds_min: &bounds_min [-0.45, -0.75, 0.698]
+  bounds_max: &bounds_max [0.10, 0.60, 1.2]
+  sdf_voxel_size: 0.01
+  vlm_camera: 0
+  action_steps_per_iter: 5
+  seed: *seed
+
+  ik:
+    descriptor: widowxai_descriptor.yaml
+    # A real link, unlike Fetch's case: the URDF ships ee_gripper_link as a fixed child of link_6
+    # at the same origin the generated eef_link occupies, so the reachability cost and the
+    # controller agree on where the end-effector is instead of differing by a gripper length.
+    eef_name: ee_gripper_link
+
+env:
+  video_cache_size: 2000
+  og_sim:
+    physics_frequency: 100
+    rendering_frequency: 20
+    action_frequency: 20
+
+  scene:
+    name: Rs_int
+    type: InteractiveTraversableScene
+    scene_model: Rs_int
+
+  bounds_min: *bounds_min
+  bounds_max: *bounds_max
+  interpolate_pos_step_size: *interpolate_pos_step_size
+  interpolate_rot_step_size: *interpolate_rot_step_size
+
+  robot:
+    robot_config:
+      name: WidowXAI
+      type: WidowXAI
+      obs_modalities: [rgb, depth]
+      action_modalities: continuous
+      action_normalize: False
+      # Fetch stands at [-0.8, 0, 0] and drives its torso up to the table. This arm is bolted
+      # down, so it has to start at working height. Placeholder pending the task-layout work.
+      position: [-0.35, 0.0, 0.698]
+      # Required by ReKep: get_sdf_voxels() reads _ag_obj_in_hand to keep the carried object out
+      # of the scene SDF, and environment.py asserts the mode is assisted or sticky.
+      grasping_mode: assisted
+
+      controller_config:
+        # No base controller: nothing to drive. No trunk or camera controller either -- this arm
+        # has neither, which is also why environment.py asks for trunk DOFs conditionally.
+        arm_0:
+          name: InverseKinematicsController
+          # Default mode; the command is (dx, dy, dz, dax, day, daz) in the robot frame, which is
+          # exactly the six numbers _move_to_waypoint already builds for Fetch's OSC.
+          mode: pose_delta_ori
+        gripper_0:
+          name: MultiFingerGripperController
+          command_input_limits: [0.0, 1.0]
+          mode: smooth
+
+  # World-fixed cameras, unchanged from the Fetch config. cam_0 feeds the VLM, cam_1 only records
+  # video. Neither is the wrist D405 -- ReKep does not use the robot's onboard camera.
+  camera:
+    # recorder
+    1:
+      name: cam_1
+      position: [ 0.6137,  0.4764,  1.4565]
+      orientation: [ 0.3212,  0.4682,  0.6788,  0.4656]
+      resolution: 480
+
+    # vlm camera
+    0:
+      name: cam_0
+      position: [-0.1655,  0.0167,  1.3664]
+      orientation: [ 0.0550,  0.0544,  0.7010,  0.7090]
+      resolution: 480
+
+path_solver:
+  opt_pos_step_size: 0.20
+  opt_rot_step_size: 0.78
+  opt_interpolate_pos_step_size: 0.02
+  opt_interpolate_rot_step_size: 0.10
+  max_collision_points: 60
+  sampling_maxfun: 5000
+  bounds_min: *bounds_min
+  bounds_max: *bounds_max
+  constraint_tolerance: 0.0001
+  minimizer_options:
+    maxiter: 200
+
+subgoal_solver:
+  bounds_min: *bounds_min
+  bounds_max: *bounds_max
+  sampling_maxfun: 5000
+  max_collision_points: 60
+  constraint_tolerance: 0.0001
+  minimizer_options:
+    maxiter: 200
+
+keypoint_proposer:
+  num_candidates_per_mask: 5
+  min_dist_bt_keypoints: 0.06
+  max_mask_ratio: 0.5
+  device: *device
+  bounds_min: *bounds_min
+  bounds_max: *bounds_max
+  seed: *seed
+
+constraint_generator:
+  model: chatgpt-4o-latest
+  temperature: 0.0
+  max_tokens: 2048
+
+visualizer:
+  bounds_min: *bounds_min
+  bounds_max: *bounds_max

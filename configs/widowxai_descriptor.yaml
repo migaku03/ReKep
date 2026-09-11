@@ -1,0 +1,39 @@
+# Lula robot descriptor for the Trossen WidowX AI Follower, the counterpart to
+# fetch_descriptor.yaml in this directory. Consumed by ReKep's IKSolver
+# (ik_solver.py -> lula.load_robot() + compute_ik_ccd()).
+#
+# This IK result is only a *reachability cost* inside the subgoal/path solvers -- it never drives
+# the robot. Execution goes through OmniGibson's own InverseKinematicsController. So the fidelity
+# that matters here is "does the optimizer correctly believe this pose is reachable", not
+# millimetre accuracy.
+#
+# One improvement over the Fetch descriptor: the IK target link is a real link. For Fetch we had
+# to aim at "wrist_roll_link" and eat a gripper-length offset, because OmniGibson's "eef_link" is
+# a runtime meta-link that does not exist in the raw URDF lula parses. The WidowX AI URDF ships
+# `ee_gripper_link` as an actual fixed-joint child of link_6, at exactly the point the generated
+# eef_link is placed, so the solver and the controller agree on where the end-effector is.
+# Pass eef_name="ee_gripper_link" when constructing the IKSolver.
+
+api_version: 1.0
+
+cspace:
+    - joint_0
+    - joint_1
+    - joint_2
+    - joint_3
+    - joint_4
+    - joint_5
+
+root_link: base_link
+
+# Matches WidowXAI._default_joint_pos (robots/widowxai.py): arm forward, gripper pointing within
+# 1.8 deg of straight down, Jacobian condition number 11.5, smallest joint-limit margin 0.291 rad.
+# Keep the two in step -- this is the seed lula descends from, and the solver's reset
+# regularisation pulls solutions toward the same configuration.
+default_q: [0.0, 1.38, 1.12, -1.28, 0.0, 0.0]
+
+# The gripper carriages are not part of the IK chain. Pinned open (travel is 0 to 0.044 m) so the
+# fingers do not appear closed to anything that reads the descriptor.
+cspace_to_urdf_rules:
+    - {name: left_carriage_joint, rule: fixed, value: 0.044}
+    - {name: right_carriage_joint, rule: fixed, value: 0.044}
