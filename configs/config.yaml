@@ -27,6 +27,13 @@ main:
   vlm_camera: 0
   action_steps_per_iter: 5
   seed: *seed
+  # Lula descriptor + IK target link for the reachability cost. Named here rather than hardcoded
+  # in main.py so a different robot is a different config file, not a code change. The target is
+  # wrist_roll_link, not eef_link, because eef_link is a runtime meta-link absent from the URDF
+  # lula parses; the gripper-length offset is acceptable for a soft cost. See config_widowxai.yaml.
+  ik:
+    descriptor: fetch_descriptor.yaml
+    eef_name: wrist_roll_link
 
 env:
   video_cache_size: 2000

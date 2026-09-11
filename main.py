@@ -11,7 +11,10 @@ from subgoal_solver import SubgoalSolver
 from path_solver import PathSolver
 from visualizer import Visualizer
 import transform_utils as T
-from omnigibson.robots.fetch import Fetch
+# Importing a robot class is what registers it with OmniGibson, so config.yaml can name it.
+# WidowXAI lives in this repo rather than under omnigibson/robots/ so that the BEHAVIOR-1K
+# checkout the Fetch baseline depends on stays untouched -- see docs/sim_platform_decision.md.
+from robots.widowxai import WidowXAI  # noqa: F401  (imported for the side effect of registering)
 from utils import (
     bcolors,
     get_config,
@@ -23,8 +26,8 @@ from utils import (
 )
 
 class Main:
-    def __init__(self, scene_file, visualize=False):
-        global_config = get_config(config_path="./configs/config.yaml")
+    def __init__(self, scene_file, visualize=False, config_path="./configs/config.yaml"):
+        global_config = get_config(config_path=config_path)
         self.config = global_config['main']
         self.bounds_min = np.array(self.config['bounds_min'])
         self.bounds_max = np.array(self.config['bounds_max'])
@@ -39,11 +42,16 @@ class Main:
         # initialize environment
         self.env = ReKepOGEnv(global_config['env'], scene_file, verbose=False)
         # setup ik solver (for reachability cost)
-        assert isinstance(self.env.robot, Fetch), "The IK solver assumes the robot is a Fetch robot"
+        #
+        # Which descriptor and which target link come from config.yaml rather than from a check
+        # on the robot's class, so that switching robots is a config edit. The IK here only
+        # produces a reachability cost for the solvers; execution goes through OmniGibson's own
+        # controller, so the target link needs to be the right *link*, not a perfect eef frame.
+        ik_cfg = self.config['ik']
         ik_solver = IKSolver(
-            robot_description_path=os.path.join(os.path.dirname(__file__), "configs", "fetch_descriptor.yaml"),
+            robot_description_path=os.path.join(os.path.dirname(__file__), "configs", ik_cfg['descriptor']),
             robot_urdf_path=self.env.robot.urdf_path,
-            eef_name="wrist_roll_link",
+            eef_name=ik_cfg['eef_name'],
             reset_joint_pos=self.env.reset_joint_pos,
             world2robot_homo=self.env.world2robot_homo,
         )
@@ -390,6 +398,11 @@ if __name__ == "__main__":
                              'large enough that single runs cannot separate the two')
     parser.add_argument('--apply_disturbance', action='store_true', help='apply disturbance to test the robustness')
     parser.add_argument('--visualize', action='store_true', help='visualize each solution before executing (NOTE: this is blocking and needs to press "ESC" to continue)')
+    parser.add_argument('--config', default='./configs/config.yaml',
+                        help='config file to run with. The default is the Fetch setup every '
+                             'result in chapters 1-20 was measured on; ./configs/config_widowxai.yaml '
+                             'swaps in the WidowX AI. Kept as a flag rather than an edit so both '
+                             'robots can be run from the same checkout without touching the baseline')
     args = parser.parse_args()
 
     if args.apply_disturbance:
@@ -493,7 +506,7 @@ if __name__ == "__main__":
     task = task_list['pen']
     scene_file = task['scene_file']
     instruction = task['instruction']
-    main = Main(scene_file, visualize=args.visualize)
+    main = Main(scene_file, visualize=args.visualize, config_path=args.config)
     main.perform_task(instruction,
                     rekep_program_dir=(args.program_dir or task['rekep_program_dir']) if args.use_cached_query else None,
                     disturbance_seq=task.get('disturbance_seq', None) if args.apply_disturbance else None)

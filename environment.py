@@ -128,8 +128,7 @@ class ReKepOGEnv:
         for _ in range(10): og.sim.step()
         # robot vars
         self.robot = self.og_env.robots[0]
-        dof_idx = np.concatenate([self.robot.trunk_control_idx,
-                                  self.robot.arm_control_idx[self.robot.default_arm]])
+        dof_idx = self._planning_dof_idx()
         reset_joint_pos = self.robot.reset_joint_pos[dof_idx]
         self.reset_joint_pos = reset_joint_pos.detach().cpu().numpy() if hasattr(reset_joint_pos, "detach") else np.asarray(reset_joint_pos)
         self.world2robot_homo = T.pose_inv(T.pose2mat(self.robot.get_position_orientation()))
@@ -220,6 +219,23 @@ class ReKepOGEnv:
         """Zero action vector sized to the robot's actual action space."""
         return np.zeros(self.robot.action_dim)
 
+    def _planning_dof_idx(self):
+        """DOF indices of the joints ReKep plans over: the trunk, if there is one, plus the arm.
+
+        Fetch lifts its whole torso, and that lift is a planning DOF -- the IK descriptor lists
+        torso_lift_joint first, and chapter 12 traced a stall to planning 8 DOF while executing 7.
+        Robots that are bolted down have no trunk at all: `trunk_control_idx` comes from
+        ArticulatedTrunkRobot, and asking a WidowX AI for it is an AttributeError. Ask for it only
+        when the robot actually is one.
+        """
+        from omnigibson.robots.articulated_trunk_robot import ArticulatedTrunkRobot
+
+        arm_idx = T.to_numpy(self.robot.arm_control_idx[self.robot.default_arm]).astype(int)
+        if isinstance(self.robot, ArticulatedTrunkRobot):
+            trunk_idx = T.to_numpy(self.robot.trunk_control_idx).astype(int)
+            return np.concatenate([trunk_idx, arm_idx])
+        return arm_idx
+
     # ======================================
     # = exposed functions
     # ======================================
@@ -231,8 +247,11 @@ class ReKepOGEnv:
         """
         start = time.time()
         exclude_names = ['wall', 'floor', 'ceiling']
-        if exclude_robot:
-            exclude_names += ['fetch', 'robot']
+        # The robot is excluded by identity, not by name. It used to be matched with the
+        # substrings 'fetch'/'robot', which worked only because config.yaml happens to name the
+        # robot "Fetch". Rename it -- as swapping in the WidowX AI does -- and the match silently
+        # stops firing, putting the arm itself into the scene SDF as an obstacle it must avoid.
+        # Nothing raises; the solver just starts refusing poses near the robot's own body.
         if exclude_obj_in_hand:
             assert self.config['robot']['robot_config']['grasping_mode'] in ['assisted', 'sticky'], "Currently only supported for assisted or sticky grasping"
             in_hand_obj = self.robot._ag_obj_in_hand[self.robot.default_arm]
@@ -240,6 +259,8 @@ class ReKepOGEnv:
                 exclude_names.append(in_hand_obj.name.lower())
         trimesh_objects = []
         for obj in self.og_env.scene.objects:
+            if exclude_robot and obj is self.robot:
+                continue
             if any([name in obj.name.lower() for name in exclude_names]):
                 continue
             for link in obj.links.values():
@@ -297,10 +318,14 @@ class ReKepOGEnv:
         self.keypoints = keypoints
         self._keypoint_registry = dict()
         self._keypoint2object = dict()
-        exclude_names = ['wall', 'floor', 'ceiling', 'table', 'fetch', 'robot']
+        # As in get_sdf_voxels: the robot is skipped by identity rather than by name matching,
+        # so that renaming the robot cannot quietly turn it into a keypoint-attachment candidate.
+        exclude_names = ['wall', 'floor', 'ceiling', 'table']
         for idx, keypoint in enumerate(keypoints):
             closest_distance = np.inf
             for obj in self.og_env.scene.objects:
+                if obj is self.robot:
+                    continue
                 if any([name in obj.name.lower() for name in exclude_names]):
                     continue
                 for link in obj.links.values():
@@ -364,23 +389,41 @@ class ReKepOGEnv:
         Get the points of the gripper and any object in hand.
         """
         # add gripper collision points
+        #
+        # The robot used to be located by testing obj.name for the substring 'fetch'. That worked
+        # only because config.yaml names the robot "Fetch", and it fails *silently* for any other
+        # robot: the loop finds nothing, collision_points stays empty, and np.concatenate below
+        # raises on a zero-length list. Locate the robot by identity instead.
+        #
+        # Which of its links count as "the gripper" is still the original name heuristic, kept
+        # deliberately so Fetch selects the same five links it always did (gripper_link,
+        # l/r_gripper_finger_link, wrist_flex_link, wrist_roll_link) and the solver sees the same
+        # geometry as every run in chapters 1-20. The union with the robot's declared finger
+        # links is what makes it work elsewhere: the WidowX AI's pads are named gripper_left /
+        # gripper_right, so they match anyway, but a robot whose fingers are named differently
+        # would still contribute its contact geometry rather than none at all.
         collision_points = []
-        for obj in self.og_env.scene.objects:
-            if 'fetch' in obj.name.lower():
-                for name, link in obj.links.items():
-                    if 'gripper' in name.lower() or 'wrist' in name.lower():  # wrist_roll and wrist_flex
-                        for collision_mesh in link.collision_meshes.values():
-                            mesh_prim_path = collision_mesh.prim_path
-                            mesh_type = collision_mesh.prim.GetPrimTypeInfo().GetTypeName()
-                            if mesh_type == 'Mesh':
-                                trimesh_object = mesh_prim_mesh_to_trimesh_mesh(collision_mesh.prim)
-                            else:
-                                trimesh_object = mesh_prim_shape_to_trimesh_mesh(collision_mesh.prim)
-                            world_pose_w_scale = PoseAPI.get_world_pose_with_scale(mesh_prim_path)
-                            trimesh_object.apply_transform(world_pose_w_scale)
-                            points_transformed = trimesh_object.sample(1000)
-                            # add to collision points
-                            collision_points.append(points_transformed)
+        arm = self.robot.default_arm
+        gripper_links = {
+            link.body_name: link
+            for name, link in self.robot.links.items()
+            if 'gripper' in name.lower() or 'wrist' in name.lower()
+        }
+        for link in self.robot.finger_links[arm]:
+            gripper_links.setdefault(link.body_name, link)
+        for link in gripper_links.values():
+            for collision_mesh in link.collision_meshes.values():
+                mesh_prim_path = collision_mesh.prim_path
+                mesh_type = collision_mesh.prim.GetPrimTypeInfo().GetTypeName()
+                if mesh_type == 'Mesh':
+                    trimesh_object = mesh_prim_mesh_to_trimesh_mesh(collision_mesh.prim)
+                else:
+                    trimesh_object = mesh_prim_shape_to_trimesh_mesh(collision_mesh.prim)
+                world_pose_w_scale = PoseAPI.get_world_pose_with_scale(mesh_prim_path)
+                trimesh_object.apply_transform(world_pose_w_scale)
+                points_transformed = trimesh_object.sample(1000)
+                # add to collision points
+                collision_points.append(points_transformed)
         # add object in hand collision points
         in_hand_obj = self.robot._ag_obj_in_hand[self.robot.default_arm]
         if in_hand_obj is not None:
@@ -428,10 +471,15 @@ class ReKepOGEnv:
         return self.get_ee_pose()[3:]
     
     def get_arm_joint_postions(self):
-        assert isinstance(self.robot, Fetch), "The IK solver assumes the robot is a Fetch robot"
-        arm = self.robot.default_arm
-        dof_idx = np.concatenate([self.robot.trunk_control_idx, self.robot.arm_control_idx[arm]])
+        # These positions are the seed the IK solver descends from, so they must line up with the
+        # `cspace` list in the robot's Lula descriptor yaml -- same joints, same order. The assert
+        # below is that agreement, not a claim about which robot is allowed.
+        dof_idx = self._planning_dof_idx()
         arm_joint_pos = T.to_numpy(self.robot.get_joint_positions())[dof_idx]
+        assert len(arm_joint_pos) == len(self.reset_joint_pos), (
+            f"planning DOF count {len(arm_joint_pos)} does not match the reset pose "
+            f"({len(self.reset_joint_pos)}); the IK descriptor's cspace is out of step with the robot"
+        )
         return arm_joint_pos
 
     def close_gripper(self):
@@ -485,10 +533,7 @@ class ReKepOGEnv:
             robot = self.robot
             arm = robot.default_arm
             names = list(robot.joints.keys())
-            dof_idx = np.concatenate([
-                T.to_numpy(robot.trunk_control_idx).astype(int),
-                T.to_numpy(robot.arm_control_idx[arm]).astype(int),
-            ])
+            dof_idx = self._planning_dof_idx()
 
             q = T.to_numpy(robot.get_joint_positions())
             qd = T.to_numpy(robot.get_joint_velocities())
@@ -731,8 +776,13 @@ class ReKepOGEnv:
                 print(f"[WP {count:>3}] eef_robot={np.round(rel_eef_pos,4).tolist()} "
                       f"cmd_dpos={np.round(relative_position,4).tolist()} "
                       f"pos_err={pos_error:.4f} rot_err={np.rad2deg(rot_error):.2f}deg", flush=True)
-            assert isinstance(self.robot, Fetch), "this action space is only for fetch"
-            action = self._empty_action()  # base/trunk/camera stay at zero
+            # The command below is (dx, dy, dz, dax, day, daz) in the robot frame. Fetch consumes
+            # it as an OSC delta; the WidowX AI consumes it as an InverseKinematicsController
+            # delta in its default "pose_delta_ori" mode. Same six numbers, same meaning, so the
+            # indices are queried from the robot in __init__ rather than assumed here. What must
+            # hold either way is that the arm controller takes exactly six -- that is asserted
+            # once, at construction.
+            action = self._empty_action()  # anything that is not arm or gripper stays at zero
             action[self.arm_action_idx[:3]] = relative_position
             action[self.arm_action_idx[3:]] = relative_axisangle
             action[self.gripper_action_idx] = self.last_og_gripper_action
