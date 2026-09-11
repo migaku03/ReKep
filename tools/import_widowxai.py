@@ -1,27 +1,39 @@
-"""Run OmniGibson's custom-robot importer, working around a bug in the pinned version.
+"""Run OmniGibson's custom-robot importer, working around two bugs in the pinned version.
 
 OmniGibson v3.7.2 ships `omnigibson/examples/robots/import_custom_robot.py`, which is the
-supported way to turn a URDF into an OmniGibson-compatible USD. In this version it does not run:
-its one call to `import_og_asset_from_urdf()` omits that function's required `dataset_root`
-argument, so the script dies with a TypeError before touching the URDF.
+supported way to turn a URDF into an OmniGibson-compatible USD. In this version the path does not
+run at all. Two links in the chain disagree about the same argument, and both have to be bridged:
 
-    TypeError: import_og_asset_from_urdf() missing 1 required positional argument: 'dataset_root'
+  1. The example script calls `import_og_asset_from_urdf()` without `dataset_root`, which that
+     function requires:
 
-The fix is one keyword argument, but it belongs to a file inside the BEHAVIOR-1K checkout, and
-the whole point of the WidowX AI work is that the existing Fetch stack keeps working untouched --
-see docs/sim_platform_decision.md. So instead of editing their file, this driver imports the
-example module and substitutes a version of that one function with `dataset_root` already bound,
-then calls the original entry point. Nothing under BEHAVIOR-1K is modified.
+        TypeError: import_og_asset_from_urdf() missing 1 required positional argument: 'dataset_root'
+
+  2. Fix that and it fails one level deeper. `import_og_asset_from_urdf` forwards `dataset_root`
+     to `convert_urdf_to_usd`, which never took it -- it takes `dataset_name`, a bare name it
+     resolves itself via `get_dataset_path()`:
+
+        TypeError: convert_urdf_to_usd() got an unexpected keyword argument 'dataset_root'
+
+This looks like a half-finished rename of `dataset_name` to `dataset_root`: the callers were
+updated, the callee was not. Since `get_dataset_path(name)` is just `DATA_PATH / name`, the
+bridge is to pass the basename -- there is no information loss, only a mismatched convention.
+
+The fixes are two keyword arguments, but they belong to files inside the BEHAVIOR-1K checkout,
+and the whole point of the WidowX AI work is that the existing Fetch stack keeps working
+untouched -- see docs/sim_platform_decision.md. So this driver substitutes both functions inside
+the namespaces that call them and then invokes the original entry point. Nothing under
+BEHAVIOR-1K is modified.
 
     cd external/ReKep
-    python tools/import_widowxai.py --config assets/widowxai/widowxai_source_config.yaml
+    python tools/import_widowxai.py --config assets/widowxai/widowxai_source_config.yaml --install
 
 Output lands in `<gm.DATA_PATH>/custom_dataset/objects/robot/<name>/`. That is *not* where
 OmniGibson looks for robots at runtime -- `robot_base.py` resolves
 `<gm.DATA_PATH>/omnigibson-robot-assets/models/<lowercased class name>/usd/<same>.usda` -- so the
-output still has to be moved. `--install` does that move for you.
+output still has to be moved. `--install` does that move.
 
-This whole file becomes unnecessary the moment the upstream call is fixed; check before
+This whole file becomes unnecessary the moment the upstream signatures agree; check before
 carrying it forward to a newer BEHAVIOR-1K.
 """
 import argparse
@@ -36,6 +48,27 @@ def _patched_importer(dataset_root):
     from omnigibson.utils.asset_conversion_utils import import_og_asset_from_urdf
 
     return functools.partial(import_og_asset_from_urdf, dataset_root=dataset_root)
+
+
+def _patch_convert_urdf_to_usd():
+    """Teach `convert_urdf_to_usd` to accept the `dataset_root` its caller insists on passing.
+
+    It wants `dataset_name` and derives the root itself with `get_dataset_path(name)`, which is
+    `DATA_PATH / name`. So a root maps back to a name by taking its last component, and the two
+    spellings carry identical information. Patched in the module that calls it, since
+    `import_og_asset_from_urdf` resolves it as a module global.
+    """
+    from omnigibson.utils import asset_conversion_utils as acu
+
+    original = acu.convert_urdf_to_usd
+
+    @functools.wraps(original)
+    def shim(*args, dataset_root=None, **kwargs):
+        if dataset_root is not None:
+            kwargs.setdefault("dataset_name", os.path.basename(os.path.normpath(dataset_root)))
+        return original(*args, **kwargs)
+
+    acu.convert_urdf_to_usd = shim
 
 
 def install(name, data_path):
@@ -77,6 +110,8 @@ def main(argv=None):
         # Bind dataset_root in the example module's namespace only. The real function in
         # asset_conversion_utils is untouched, so anything else importing it is unaffected.
         importer.import_og_asset_from_urdf = _patched_importer(dataset_root)
+        # ...and reconcile the name/root mismatch one level down.
+        _patch_convert_urdf_to_usd()
 
         # .callback is the undecorated function; calling the click command directly would try to
         # parse our argv as its own.
