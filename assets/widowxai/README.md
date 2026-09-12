@@ -4,6 +4,14 @@ The robot this research will actually use. Vendored rather than downloaded on de
 input to the USD conversion is fixed: the conversion is not reproducible if the thing being
 converted can change under it.
 
+**The importer does not treat its input as read-only.** It rewrites the URDF it is handed --
+swapping each collision mesh for the CoACD-decomposed set, and writing a `*_with_meta_links.urdf`
+beside it -- and it resolves mesh paths relative to that file, so the decomposition lands in the
+same directory. Run it twice in place and the second run converts the first run's output. So
+`tools/import_widowxai.py` copies this directory to a scratch location and converts the copy;
+what is committed here stays as Trossen published it. (An earlier note in this file claimed the
+source was untouched. That was wrong, and `git status` is what caught it.)
+
 ## Provenance
 
 | | |

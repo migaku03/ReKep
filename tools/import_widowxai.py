@@ -185,6 +185,25 @@ def main(argv=None):
     urdf_src = os.path.abspath(cfg["urdf_path"])
 
     if not args.install_only:
+        # Import from a throwaway copy, never from the vendored source.
+        #
+        # The importer rewrites the URDF it is handed -- it swaps each collision mesh for the
+        # CoACD-decomposed set and drops a *_with_meta_links.urdf beside it -- and it resolves
+        # mesh paths relative to that file, so the decomposition lands in the source tree too.
+        # Run it twice in place and the second run is converting the first run's output. That
+        # defeats the whole point of vendoring the asset, which was to fix what gets converted.
+        work = os.path.join(gm.DATA_PATH, "custom_dataset", "_import_work", name)
+        if os.path.isdir(work):
+            shutil.rmtree(work)
+        shutil.copytree(os.path.dirname(urdf_src), work)
+        cfg["urdf_path"] = os.path.join(work, os.path.basename(urdf_src))
+        work_config = os.path.join(work, "source_config.yaml")
+        os.makedirs(os.path.dirname(work_config), exist_ok=True)
+        with open(work_config, "w") as f:
+            yaml.safe_dump(cfg, f)
+        args.config = work_config
+        print(f"importing from a copy at {work} (vendored source left untouched)")
+
         dataset_root = os.path.join(gm.DATA_PATH, "custom_dataset")
         os.makedirs(dataset_root, exist_ok=True)
 

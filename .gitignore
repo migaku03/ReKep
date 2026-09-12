@@ -24,3 +24,4 @@ keypoint_proposals/
 # paths in the URDF resolve relative to it. Derived, not source: regenerate with
 #   python tools/import_widowxai.py --config assets/widowxai/widowxai_source_config.yaml
 assets/widowxai/meshes/collision/
+assets/widowxai/*_with_meta_links.urdf
