@@ -123,6 +123,23 @@ def main():
     if align_y < 0.9:
         failures.append(f"eef y axis is not the finger separation axis (|dot| = {align_y:.3f})")
 
+    # Ground truth for z (approach) from link_6 -> fingertip midpoint, not eef -> fingertip
+    # midpoint: eef_link's own origin sits right at the pads' tip (see docs/widowxai_bringup_status.md
+    # and tools/derive_ag_points.py), so a vector measured from *it* toward the fingers is only a
+    # few mm long and its sign is dominated by noise. link_6 sits well back from the tip, so the
+    # same vector from there is long and its direction is unambiguous.
+    link6_pos = np.asarray(
+        (lambda p: p.cpu() if hasattr(p, "cpu") else p)(robot.links["link_6"].get_position_orientation()[0]),
+        dtype=float,
+    )
+    midpoint = (fpos[0] + fpos[1]) / 2.0
+    approach = midpoint - link6_pos
+    approach = approach / np.linalg.norm(approach)
+    align_z = float(R[:, 2] @ approach)
+    print(f"   dot(column 2, link_6->fingertip midpoint) = {align_z:.4f}   (want ~+1: z points out of the fingertips)")
+    if align_z < 0.9:
+        failures.append(f"eef z axis does not point out of the fingertips (dot = {align_z:.3f})")
+
     print()
     print("=" * 72)
     print("3. assisted-grasp ray endpoints")

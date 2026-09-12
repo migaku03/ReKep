@@ -26,7 +26,7 @@ from functools import cached_property
 
 import torch as th
 
-from omnigibson.robots.manipulation_robot import ManipulationRobot
+from omnigibson.robots.manipulation_robot import GraspingPoint, ManipulationRobot
 from omnigibson.utils.transform_utils import euler2quat
 
 
@@ -162,14 +162,65 @@ class WidowXAI(ManipulationRobot):
 
     @cached_property
     def finger_link_names(self):
-        # The pads, not the carriages they bolt to. These carry the contact geometry, and
-        # ManipulationRobot measures them to place the assisted-grasp ray endpoints.
+        # The pads, not the carriages they bolt to -- these carry the contact geometry. Note
+        # ManipulationRobot's own auto-inference of grasp geometry from these links does not
+        # work for this robot; see _assisted_grasp_start_points/_assisted_grasp_end_points below.
         return {self.default_arm: ["gripper_left", "gripper_right"]}
 
     @cached_property
     def finger_joint_names(self):
-        # Prismatic, 0 to 0.044 m each; larger is more open.
-        return {self.default_arm: ["left_carriage_joint", "right_carriage_joint"]}
+        # Prismatic, 0 to 0.044 m, larger is more open. Only the left one is listed: the gripper
+        # is a rack-and-pinion parallel jaw, one actuator driving both jaws, so the URDF marks
+        # right_carriage_joint as <mimic joint="left_carriage_joint"/>. Isaac's importer gives
+        # mimic joints no drive (PhysX follows it by constraint instead), so listing both here
+        # would have MultiFingerGripperController try to drive a joint that cannot be driven:
+        #   AssertionError: Controllers should only control driveable joints!
+        # finger_link_names above still lists both pads -- nothing here requires the two to have
+        # equal length. assisted_grasp_start_points is built from finger_link_names only
+        # (manipulation_robot.py), and gripper_control_idx/MultiFingerGripperController accept a
+        # dof_idx of any length. See docs/widowxai_bringup_status.md.
+        return {self.default_arm: ["left_carriage_joint"]}
+
+    # Hand-authored assisted-grasp ray endpoints, following the pattern every end-effector option
+    # in omnigibson/robots/franka.py uses. ManipulationRobot's own auto-inference
+    # (_infer_finger_properties, manipulation_robot.py) finds each finger's "parent" by searching
+    # self.joints for a *driven* (nonzero-DOF) joint whose body1 is the finger link itself -- true
+    # for every gripper OmniGibson ships, where the finger link is the direct child of the driven
+    # joint. Here it is not: left_carriage_joint's child is carriage_left, and gripper_left hangs
+    # off that through a second, fixed joint. Fixed joints carry zero DOF and are excluded from
+    # self.joints entirely (entity_prim.py:update_joints), so the search finds nothing:
+    #   AssertionError: Expected articulated parent joint for finger link WidowXAI:gripper_left
+    #   but found none!
+    # That gets caught and downgraded to a log.warning by _initialize(), which is why the robot
+    # still loads -- but assisted_grasp_start_points/_end_points then raise KeyError on the arm
+    # name, since _default_ag_start_points/_end_points never got populated.
+    #
+    # These four points reproduce the same geometric derivation _infer_finger_properties uses
+    # (see tools/derive_ag_points.py, which computed them), substituting link_6 for the
+    # joint-connected parent -- correct here because link_6 is body0 of *both* carriage joints,
+    # i.e. the true common base the fingers extend from regardless of what the joint search can
+    # see. One deviation from upstream's formula: it additionally clamps and asserts the two
+    # z-values straddle the eef's z=0 plane, which assumes the eef origin sits well behind the
+    # fingertip. WidowX AI's `ee_gripper` offset instead puts the eef origin right at the pad's
+    # own tip (measured finger_max_z = +0.0004 m, essentially zero), so there is no room in front
+    # of z=0 to straddle. Dropped that clamp in favour of two points spanning the same 20%-95%
+    # window of the finger's own physical length measured from its base at link_6.
+    _ag_start_points = [
+        GraspingPoint(link_name="gripper_left", position=th.tensor([0.00918, -0.02536, 0.0])),
+        GraspingPoint(link_name="gripper_left", position=th.tensor([0.06614, -0.02536, 0.0])),
+    ]
+    _ag_end_points = [
+        GraspingPoint(link_name="gripper_right", position=th.tensor([0.00918, 0.02536, 0.0])),
+        GraspingPoint(link_name="gripper_right", position=th.tensor([0.06611, 0.02536, 0.0])),
+    ]
+
+    @property
+    def _assisted_grasp_start_points(self):
+        return {self.default_arm: self._ag_start_points}
+
+    @property
+    def _assisted_grasp_end_points(self):
+        return {self.default_arm: self._ag_end_points}
 
     @property
     def teleop_rotation_offset(self):
