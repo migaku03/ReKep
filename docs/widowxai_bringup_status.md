@@ -4,7 +4,7 @@ Working state for `robot/widowx-ai`, written to survive a context compaction. Re
 when resuming; it is the state of *this branch*, which is why it lives here and not in the parent
 repo's `docs/`.
 
-Last updated: 2026-09-12 (Stage 2 completed and verified)
+Last updated: 2026-09-12 (bring-up complete: all four stages done, see Stage 4 attempt 2)
 
 ## What this is
 
@@ -48,8 +48,8 @@ redesigned for a bolted-down 0.7 m arm. That redesign is a separate piece of wor
 | 0 | Branch cut, Fetch preserved | **done** |
 | 1 | URDF → USD conversion and install | **done** -- re-run once, see camera_link fix below |
 | 2 | Robot class + standalone bring-up checks | **done** -- all four checks in `tools/check_widowxai.py` pass |
-| 3 | De-Fetch the ReKep environment layer, WidowX config, Lula descriptor | **runs without error** -- `main.py` loads the config, builds the scene, prints AABBs and the action layout, and reaches the solver. The de-Fetching code itself is not what failed (see Stage 4) |
-| 4 | `main.py` startup check | **attempted, failed on a Stage 1 asset defect (now fixed), not yet re-attempted** |
+| 3 | De-Fetch the ReKep environment layer, WidowX config, Lula descriptor | **done** -- runs without error across both Stage 4 attempts |
+| 4 | `main.py` startup check | **done** -- 5-minute headless run, no crash, no instability. Loops without completing the task (expected, see below) |
 
 Stage 2's checker is `tools/check_widowxai.py`. It took four runs to get through, each pushing the
 failure further:
@@ -243,19 +243,65 @@ check 4 (IK moves the arm) now tracks the commanded +x delta cleanly
 a chaotic, mostly-off-axis response even in the checker's own empty scene. The z-axis measurement
 also tightened to exactly 1.0000 (was 0.9903).
 
+## Stage 4, attempt 2: no crash, stable physics, stuck in a backtrack loop (expected)
+
+Same command, `OMNIGIBSON_HEADLESS=1`, capped at 5 minutes (`timeout 300`):
+
+```
+export OPENAI_API_KEY="sk-dummy-not-used-cached-query-only"
+export OMNIGIBSON_HEADLESS=1
+python main.py --use_cached_query --config ./configs/config_widowxai.yaml
+```
+
+**No explosion this time.** Every `[STALL]` block in this run shows joint efforts in the single-
+to-low-double digits (`eff_norm` a few tenths to ~0.8) and a stable Jacobian condition number of
+32.6, against attempt 1's efforts in the hundreds to 599x saturation. `base_link <-> table_1` is
+still listed as a contact (the base sits essentially flush with the tabletop, z=0.69 vs the
+table's own top at z=0.697), but it is no longer producing runaway force -- it is a static,
+low-force contact the whole run. The camera_link fix is confirmed as the actual cause of attempt
+1's explosion, not a symptom of something else.
+
+Ran for the full 5 minutes without crashing: 1133 physics steps, `[DEBUG keypoints]` printing
+every loop iteration, `execute_action`'s OSC path clearly driving the arm (`OSC pose not reached
+after N steps` messages with shrinking-then-stalling position error). This satisfies the Stage 4
+success criterion from the approved plan -- ReKep starts up and runs its full pipeline (keypoint
+read -> backtrack check -> subgoal solver -> path solver -> OSC execution) on the WidowX AI
+without crashing.
+
+**It does not make task progress.** The log shows `[stage=2] backtrack to stage 1` nine times in
+the 5-minute window, with the end-effector barely moving between them (a 1-2 cm jitter around
+`[-0.28, -0.09, 0.72]`). Cause, from the joint state in the `[STALL]` blocks: `joint_2` is pinned
+at its upper limit (`2.3562`) and `joint_3` at its lower limit (`-1.5708`) across every stall in
+this stretch of the run -- the arm is physically unable to reach the pose stage 2's path
+constraint needs, so every loop immediately fails that constraint's tolerance check and backtracks
+straight back to stage 1, repeating indefinitely.
+
+**This is the expected failure mode, not a new bug.** It is exactly what
+`docs/widowxai_bringup_status.md`'s own scope note and `assets/widowxai/README.md` have said from
+the start: the pen-task layout and its workspace bounds (`configs/config_widowxai.yaml`'s
+`bounds_min`/`bounds_max`, still copied verbatim from Fetch) were authored for a mobile base with
+a lifting torso, not a 0.7 m fixed arm bolted to one spot on the table -- re-deriving them is
+explicitly out of scope for this bring-up (see "What this is" at the top of this document). One
+data point in favour of this reading over a deeper bug: `contacts[robot]` briefly listed
+`gripper_right <-> pen_1` early in the run, i.e. the arm did get physically close to the pen at
+least once -- the joint-limit pin-out happening specifically at the stage-2 target rather than
+everywhere is consistent with "reachable region is smaller than the task assumes," not with a
+broken kinematic chain or controller.
+
 ## Next step
 
-**Re-attempt Stage 4** with the fixed asset -- same command as above. Not yet re-run against the
-full pen-task scene at the time of writing. If the arm is stable this time, proceed to check
-whether it reaches `[DEBUG keypoints]` / `execute_action` and record the outcome here in the same
-format used for the Stage 2 blockers and the finding above. `[OUTCOME] SUCCESS` is still *not*
-expected and is out of scope -- the pen-task layout was authored for Fetch's mobile base and
-lifting torso and has not been redesigned for a bolted-down 0.7 m fixed arm.
+**Bring-up is done as scoped.** All four stages are green: the robot loads, its geometry and eef
+frame are measured and correct, and `main.py` runs the full ReKep pipeline on it without crashing
+or going unstable. What remains -- the pen task not completing -- was never in scope for this
+piece of work (see "What this is"); it is task-layout and workspace-bounds redesign for a
+bolted-down 0.7 m arm, which is separate work.
 
-If a new problem turns up, check first whether it is another asset-conversion defect like this one
-(inspect the USD directly, as done here) before assuming it is a logic bug in `environment.py` or
-`main.py` -- Stage 3's code itself has now run cleanly twice (this attempt and the one that
-exploded) with no Python-level errors of its own.
+If that redesign is picked up next, start from the joint-limit pin-out above rather than from
+scratch: `joint_2` and `joint_3` hitting their limits at the stage-2 target suggests the current
+`bounds_min`/`bounds_max` (and possibly the base `position` in `configs/config_widowxai.yaml`)
+reach past what this arm can actually cover from where it is bolted down, and
+`tools/analyze_wxai_kinematics.py` (parent repo) already has the machinery to map out the real
+reachable envelope rather than guessing new bounds by trial and error.
 
 ## Reference: the seven incompatibilities found so far
 
