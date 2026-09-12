@@ -38,7 +38,19 @@ collision:
   convex_links:
     - base_link      # ratio 0.78, and it is bolted to the world; a hull costs nothing here
   no_decompose_links: []
-  no_collision_links: []   # camera_link's collision is already a box primitive in the URDF
+  # camera_link's collision is a <box size="0.023 0.042 0.042"/> primitive in the URDF -- the
+  # only primitive (non-mesh) collision geometry anywhere in this file. The importer does not
+  # handle that correctly: instead of a 4cm box it produced several CoACD-style hull pieces
+  # (camera_link_col_0..N in the USD) with per-piece xformOp:scale up to ~40x and centred several
+  # metres from the link origin -- effectively a room-sized invisible collider rigidly attached to
+  # the wrist. Confirmed as the cause of the arm exploding at the very first physics step (contact
+  # log showed camera_link simultaneously touching the ceiling, floor, every wall, the table, and
+  # the pen). ReKep never uses this robot's onboard camera -- it reads two world-fixed cameras
+  # instead (assets/widowxai/README.md) -- so the fix is to skip collision for this link entirely
+  # rather than chase the box-primitive import path. camera_mount_d405, the only other
+  # camera-branch link with a <collision> block, uses a plain mesh reference (not a primitive) and
+  # decomposes normally -- left alone.
+  no_collision_links: [camera_link]
 
 # Rotates the end-effector frame into OmniGibson's convention (z out of the fingertips, y from
 # the left finger to the right) without moving its origin. The URDF's own ee_gripper_link puts

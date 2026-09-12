@@ -46,10 +46,10 @@ redesigned for a bolted-down 0.7 m arm. That redesign is a separate piece of wor
 | Stage | What | State |
 |---|---|---|
 | 0 | Branch cut, Fetch preserved | **done** |
-| 1 | URDF → USD conversion and install | **done** |
+| 1 | URDF → USD conversion and install | **done** -- re-run once, see camera_link fix below |
 | 2 | Robot class + standalone bring-up checks | **done** -- all four checks in `tools/check_widowxai.py` pass |
-| 3 | De-Fetch the ReKep environment layer, WidowX config, Lula descriptor | written, **not yet verified** |
-| 4 | `main.py` startup check | not started |
+| 3 | De-Fetch the ReKep environment layer, WidowX config, Lula descriptor | **runs without error** -- `main.py` loads the config, builds the scene, prints AABBs and the action layout, and reaches the solver. The de-Fetching code itself is not what failed (see Stage 4) |
+| 4 | `main.py` startup check | **attempted, failed on a Stage 1 asset defect (now fixed), not yet re-attempted** |
 
 Stage 2's checker is `tools/check_widowxai.py`. It took four runs to get through, each pushing the
 failure further:
@@ -193,24 +193,69 @@ from the Fetch-era fix, chapter 11) need **no further change** for this robot.
 The vendoring-hygiene fixes described in the previous version of this document are committed
 (`ff34f4b`). Nothing outstanding there.
 
-## Next step
+## Stage 4, attempt 1: the arm exploded -- traced to a Stage 1 asset defect, not a Stage 3/4 bug
 
-**Stage 3.** `configs/config_widowxai.yaml`, `configs/widowxai_descriptor.yaml`, and the
-de-Fetching of `environment.py`/`main.py` were written before Stage 2 finished and have not been
-exercised. With Stage 2 now fully green, the next action is:
-
+First run of
 ```
 cd external/ReKep
 export OPENAI_API_KEY="sk-dummy-not-used-cached-query-only"
 python main.py --use_cached_query --config ./configs/config_widowxai.yaml
 ```
+reached the solver (an `[OUTCOME]`-style optimisation debug block printed, with
+`subgoal_constraint_cost: 286.5` and `msg: Maximum number of function call reached during
+annealing` -- i.e. Stage 3's de-Fetched `environment.py`/`main.py` code path ran with no Python
+errors). But watching it run, the arm was unstable from the very first physics step: it flailed
+immediately, sent the pen and its holder flying, and eventually knocked the table away too.
 
-Success criterion (per the approved plan): reaching the first solver iteration without crashing --
-`[DEBUG keypoints]` and `execute_action` log lines appearing. `[OUTCOME] SUCCESS` is *not*
-expected and is out of scope; the pen-task layout was authored for Fetch's mobile base and lifting
-torso and has not been redesigned for a bolted-down 0.7 m fixed arm. Whatever the first failure
-turns out to be (if any), record it here in the same "blockers hit and resolved" format before
-attempting a fix, the same way each Stage 2 blocker was recorded above as it was found.
+The `[STALL]` diagnostic block (`environment.py`'s own logging, printed after 120 stalled steps)
+had the answer:
+
+```
+contacts[robot] = ['base_link <-> table_1/base_link',
+                    'camera_link <-> ceilings_*/base_link', 'camera_link <-> floors_*/base_link',
+                    'camera_link <-> walls_*/base_link' (all four walls),
+                    'camera_link <-> pen_1/base_link', 'camera_link <-> table_1/base_link', ...]
+```
+joint efforts on every arm joint reading in the hundreds to low thousands (`eff_norm` up to 599x
+its own torque limit). One link cannot physically touch the ceiling, the floor, and all four walls
+at once unless its collision volume is roughly room-sized -- which is exactly what had happened.
+
+**Root cause, confirmed by reading the converted USD directly:** `camera_link`'s collision
+geometry in the source URDF is a `<box size="0.023 0.042 0.042"/>` primitive (2.3 x 4.2 x 4.2 cm)
+-- the *only* primitive (non-mesh) collision in the entire URDF; grepped for `<box>`/`<cylinder>`/
+`<sphere>` to confirm. The importer does not handle that correctly: instead of a small box, the
+USD contained several CoACD-style hull pieces (`camera_link_col_0` .. `_col_N`) each carrying a
+per-piece `xformOp:scale` up to roughly 40x, centred multiple metres from the link origin -- in
+effect a room-sized invisible collider rigidly bolted to the wrist. `camera_mount_d405`, the only
+other camera-branch link with a `<collision>` block, references a plain mesh (not a primitive) and
+decomposed normally; the defect is specific to how this importer path handles a `<box>` primitive
+when routed through CoACD.
+
+**Fixed at the source**, not by patching the importer: `camera_link` added to `no_collision_links`
+in `assets/widowxai/widowxai_source_config.yaml`. Justified rather than a workaround of
+convenience -- `assets/widowxai/README.md` already establishes that ReKep never uses this robot's
+onboard camera (it reads two world-fixed cameras instead), so the wrist camera housing having no
+collision costs nothing functionally. Re-ran Stage 1's import + Stage 2's conform + all four
+`check_widowxai.py` checks after the fix: the USD now has an empty `collisions` scope under
+`camera_link` (confirmed by reading it directly) and all checks still pass -- notably
+check 4 (IK moves the arm) now tracks the commanded +x delta cleanly
+(`before [0.2299, 0.0, 0.1051] -> after [0.3432, -0.0, 0.1053]`), where the pre-fix run had shown
+a chaotic, mostly-off-axis response even in the checker's own empty scene. The z-axis measurement
+also tightened to exactly 1.0000 (was 0.9903).
+
+## Next step
+
+**Re-attempt Stage 4** with the fixed asset -- same command as above. Not yet re-run against the
+full pen-task scene at the time of writing. If the arm is stable this time, proceed to check
+whether it reaches `[DEBUG keypoints]` / `execute_action` and record the outcome here in the same
+format used for the Stage 2 blockers and the finding above. `[OUTCOME] SUCCESS` is still *not*
+expected and is out of scope -- the pen-task layout was authored for Fetch's mobile base and
+lifting torso and has not been redesigned for a bolted-down 0.7 m fixed arm.
+
+If a new problem turns up, check first whether it is another asset-conversion defect like this one
+(inspect the USD directly, as done here) before assuming it is a logic bug in `environment.py` or
+`main.py` -- Stage 3's code itself has now run cleanly twice (this attempt and the one that
+exploded) with no Python-level errors of its own.
 
 ## Reference: the seven incompatibilities found so far
 

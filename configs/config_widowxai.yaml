@@ -20,16 +20,17 @@ main:
   interpolate_rot_step_size: &interpolate_rot_step_size 0.34  # about 20 degrees
   grasp_depth: 0.10
 
-  # Unlike Fetch, this robot's approach axis is expected to land on the eef frame's z column,
-  # because the imported eef_link is built to OmniGibson's convention (z out of the fingertips)
-  # rather than inherited from the URDF's x-forward ee_gripper_link. 'z' with ratio 1.0 makes the
-  # pregrasp standoff and the grasp advance cancel, so the gripper lands exactly on the pose the
-  # solver returned while approaching from above -- which is the behaviour chapter 11 wanted and
-  # could not have on Fetch.
+  # Unlike Fetch, this robot's approach axis lands on the eef frame's z column, because the
+  # imported eef_link is built to OmniGibson's convention (z out of the fingertips) rather than
+  # inherited from the URDF's x-forward ee_gripper_link. 'z' with ratio 1.0 makes the pregrasp
+  # standoff and the grasp advance cancel, so the gripper lands exactly on the pose the solver
+  # returned while approaching from above -- which is the behaviour chapter 11 wanted and could
+  # not have on Fetch.
   #
-  # VERIFY THIS BEFORE TRUSTING IT. Print the columns of get_ee_pose()'s rotation matrix on the
-  # loaded robot and confirm column 2 points out of the fingertips. The URDF says one thing; what
-  # the conversion produced is a separate question. See assets/widowxai/README.md.
+  # Measured on the loaded robot, not assumed from the URDF/import config (tools/check_widowxai.py):
+  # column 2 points out of the fingertips (dot with the link_6->fingertip-midpoint direction =
+  # 0.99) and column 1 is exactly the finger-separation axis (dot = 1.00). See
+  # docs/widowxai_bringup_status.md.
   grasp_approach_axis: z
   grasp_standoff_ratio: 1.0
 
