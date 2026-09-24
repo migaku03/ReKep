@@ -288,20 +288,85 @@ least once -- the joint-limit pin-out happening specifically at the stage-2 targ
 everywhere is consistent with "reachable region is smaller than the task assumes," not with a
 broken kinematic chain or controller.
 
+## Stage 4, attempt 3: the grasp itself, fixed -- pen now lifts cleanly off the table
+
+The user ran attempt 2 themselves (GUI, not headless) and reported: motion was smooth, no
+instability (matches the headless finding above), but the pencil holder had fallen off the table,
+and the gripper closed *above* the pen, missing it.
+
+**Pencil holder: confirmed pre-existing, unrelated to this branch.** `git diff
+port/behavior1k-v3.7.2 -- configs/og_scene_file_pen.json` is empty -- this file has not been
+touched since before the WidowX AI work started (last changed in `81b41ea`, "Restore the pen to
+the size the demo was built around"). Its AABB at scene load (`stage4_run2.log`,
+`environment.py`'s own printout, i.e. before the robot has moved at all): `pencil_holder_1
+xy=[-0.588,-0.427]x[0.126,0.284]` against `table_1 xy=[-0.376,0.644]x[-1.227,1.182]` -- the
+holder's x-range sits entirely outside the table's, a ~5cm gap, and its z-range already reads
+`[-0.0000, 0.1243]`, i.e. resting on the *floor*, at the very first printout. This would happen
+with Fetch too; it is a defect in the shared scene file's authored object placement, not something
+this branch introduced or can fix without touching the scene both robots use. Not fixed here --
+flagged for whoever next touches `og_scene_file_pen.json`.
+
+**The grasp-height miss: root-caused, fixed, and verified.** `stage4_run2.log`'s `[GRASP AXES]`
+lines (`main.py`'s own diagnostic print, fires once per grasp attempt) show the *raw, unclipped*
+descent target landing at world z = 0.6706-0.6924 across several attempts -- deliberately below
+the table top (0.6972) by design, per `_execute_grasp_action`'s own comment ("the advance is
+deliberately aimed *through* the object"). But `environment.py`'s workspace-bounds clip fired on
+every single attempt (`"Target position is out of bounds, clipping to workspace bounds"`,
+immediately following each `[GRASP AXES]` line), because `bounds_min[2]` was still 0.698 -- the
+Fetch number, already flagged in this doc as not yet re-derived. The eef tip never got to descend
+past table height.
+
+That alone would only mean "descends a bit less than intended," not "misses the pen entirely" --
+so a second factor had to be involved. Measured directly with the new `tools/check_grasp_depth.py`
+(transforms the four hand-authored `_ag_start_points`/`_ag_end_points` from
+`robots/widowxai.py` into the eef-local frame): the region *between* the open jaws -- where an
+object actually needs to sit to be grasped -- averages z_local = -0.0319 m (range -0.0034 to
+-0.0604), i.e. it sits roughly 3cm *behind* the eef tip, toward the wrist. Combined with the
+eef's near-vertical approach (`localZ->world` z-component consistently around -0.99), that 3cm
+behind-the-tip offset becomes roughly 3cm *above* the tip in world height. With the tip clipped at
+table height (0.698) and the pen's own top surface at 0.7172, the jaws were closing at
+approximately 0.698 + 0.0316 = 0.7296 -- about 1.2cm above the pen's top. That is the mechanism
+behind "grasping above the pen."
+
+**Fix:** lowered `bounds_min[2]` in `configs/config_widowxai.yaml` from 0.698 to 0.665 -- below
+every unclipped target logged (0.6706-0.6924) with a small margin, still consistent with the
+existing "aim through the object" design rather than a deeper change to it. Full reasoning is
+recorded in the config file itself, next to the value.
+
+**Verified**, same 5-minute headless run as attempt 2:
+- `[GRASP AXES]` fires exactly once (not 9+ times like attempt 2) -- the grasp succeeds on the
+  first try.
+- `[GRASP] ag_obj_in_hand=pen_1` immediately after.
+- Zero `backtrack to stage 1` for the rest of the run (attempt 2 had 9 in the same window) -- the
+  grasp-failure-driven backtrack loop is gone entirely.
+- Final `[STALL]` block: `pen_1 aabb z=[0.7325,0.8060] (tabletop is 0.6970)` -- the pen is lifted
+  clear of the table -- and `contacts[pen_1] = ['base_link <-> .../gripper_right']` -- its only
+  contact is the gripper, nothing else. A clean, held grasp.
+
+**What's left after the grasp is the already-known limitation, not a new one.** Stage 2
+(reorientation) now runs into `joint_4` sitting exactly at 1.5708 rad (= pi/2, its own travel
+limit and the wrist's documented singularity, `docs/sim_platform_decision.md` section 5), Jacobian
+condition number 17615.8. This is the fixed-base reach/layout mismatch this document has flagged
+from the start (see "What this is" and the Stage 4 attempt-2 note below) -- not something this fix
+was meant to address.
+
 ## Next step
 
-**Bring-up is done as scoped.** All four stages are green: the robot loads, its geometry and eef
-frame are measured and correct, and `main.py` runs the full ReKep pipeline on it without crashing
-or going unstable. What remains -- the pen task not completing -- was never in scope for this
-piece of work (see "What this is"); it is task-layout and workspace-bounds redesign for a
-bolted-down 0.7 m arm, which is separate work.
+**Grasping now works; reorientation still does not, for the reason already on record.** The pen
+lifts cleanly on the first attempt. What remains is the stage-2 target driving `joint_4` into its
+own singularity/limit -- task-layout and workspace-bounds redesign for a bolted-down 0.7 m arm,
+which was out of scope for this bring-up from the start (see "What this is") and still is.
 
-If that redesign is picked up next, start from the joint-limit pin-out above rather than from
-scratch: `joint_2` and `joint_3` hitting their limits at the stage-2 target suggests the current
-`bounds_min`/`bounds_max` (and possibly the base `position` in `configs/config_widowxai.yaml`)
-reach past what this arm can actually cover from where it is bolted down, and
-`tools/analyze_wxai_kinematics.py` (parent repo) already has the machinery to map out the real
-reachable envelope rather than guessing new bounds by trial and error.
+If that redesign is picked up next:
+- Start from the joint-limit pin-out above rather than from scratch: `joint_2`-`joint_4` hitting
+  their limits at the stage-2 target suggests the current `bounds_min`/`bounds_max` (and possibly
+  the base `position` in `configs/config_widowxai.yaml`) reach past what this arm can actually
+  cover from where it is bolted down. `tools/analyze_wxai_kinematics.py` (parent repo) already has
+  the machinery to map out the real reachable envelope rather than guessing new bounds by trial
+  and error.
+- Separately, `configs/og_scene_file_pen.json`'s `pencil_holder_1` placement (off the table edge
+  at scene load, see above) needs fixing if the pencil-holder part of the task matters going
+  forward -- it is shared with the Fetch config, so fixing it affects both robots.
 
 ## Reference: the seven incompatibilities found so far
 

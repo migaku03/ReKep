@@ -35,9 +35,28 @@ main:
   grasp_standoff_ratio: 1.0
 
   constraint_tolerance: 0.10  # for backtracking
-  # Workspace box. Still the Fetch numbers; re-deriving these for a fixed base whose kinematic
-  # reach is 0.833 m is part of the task-layout work that has not been done yet.
-  bounds_min: &bounds_min [-0.45, -0.75, 0.698]
+  # Workspace box. x/y still the Fetch numbers; re-deriving those for a fixed base whose
+  # kinematic reach is 0.833 m is separate task-layout work, not done yet.
+  #
+  # bounds_min z WAS also the Fetch number (0.698, table-top height) and was found to be the
+  # direct cause of the grasp missing the pen: environment.py's workspace-bounds clip
+  # (execute_action, "Target position is out of bounds, clipping to workspace bounds") fired on
+  # every grasp attempt, so the eef tip never descended past 0.698. _execute_grasp_action's
+  # advance is deliberately aimed a few cm past the raw solved pose ("through the object"), and
+  # for Fetch that overshoot happened to still land the grasp zone right; for this robot it did
+  # not, for a geometric reason specific to it: WidowX AI's eef tip sits almost exactly at the
+  # fingertip (measured finger_max_z ~ 0.0004, docs/widowxai_bringup_status.md), but the region
+  # BETWEEN the open jaws -- where an object actually needs to be for the fingers to close around
+  # it -- sits ~3cm further back toward the wrist (measured directly, tools/check_grasp_depth.py:
+  # the four hand-authored AG points average z_local = -0.0319 m in the eef frame, i.e. behind
+  # the tip). Given the eef's near-vertical approach (~99% along -world z), that ~3cm offset
+  # translates to the jaws closing ~3cm ABOVE wherever the tip stopped -- with the tip clipped at
+  # table height, the jaws closed roughly 1.2cm above the pen's own top surface (pen AABB z max
+  # 0.7172 vs clipped tip 0.698 + ~0.0316 offset =~ 0.7296), i.e. exactly "grasping above the
+  # pen." The logged unclipped targets ran 0.6706-0.6924 across several attempts; 0.665 sits
+  # below all of them with a small margin, without going meaningfully deeper than what the
+  # existing "aim through the object" design already relies on.
+  bounds_min: &bounds_min [-0.45, -0.75, 0.665]
   bounds_max: &bounds_max [0.10, 0.60, 1.2]
   sdf_voxel_size: 0.01
   vlm_camera: 0
