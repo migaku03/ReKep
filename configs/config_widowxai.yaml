@@ -53,10 +53,24 @@ main:
   # translates to the jaws closing ~3cm ABOVE wherever the tip stopped -- with the tip clipped at
   # table height, the jaws closed roughly 1.2cm above the pen's own top surface (pen AABB z max
   # 0.7172 vs clipped tip 0.698 + ~0.0316 offset =~ 0.7296), i.e. exactly "grasping above the
-  # pen." The logged unclipped targets ran 0.6706-0.6924 across several attempts; 0.665 sits
-  # below all of them with a small margin, without going meaningfully deeper than what the
-  # existing "aim through the object" design already relies on.
-  bounds_min: &bounds_min [-0.45, -0.75, 0.665]
+  # pen." The logged unclipped targets first ran 0.6706-0.6924 across several attempts, and 0.665
+  # was set below all of them.
+  #
+  # That was not the end of it. subgoal_solver.py runs dual_annealing (a stochastic global
+  # optimiser) for the grasp pose, so the raw target is not one fixed number -- it is whatever
+  # that run's annealing happened to converge to. After an unrelated fix (this robot's base was
+  # spawning ~0.7cm into the table; see the `position` comment on the robot block above), a fresh
+  # run's raw targets came back at 0.6012-0.6245 -- a good 4-6cm below the first sample and below
+  # 0.665 -- and the grasp missed again, clipped the same way.
+  #
+  # Rather than keep chasing whatever the next run's annealing draws (whack-a-mole against a
+  # stochastic solver), bounds_min z is set generously low: 0.55, about 15cm below the measured
+  # table top (0.697) and 55cm above the floor (0.0). Its job here is only to stop the eef from
+  # ever reaching the floor or some other absurd target on a NON-grasp move, not to shape the
+  # grasp descent -- that shaping is _execute_grasp_action's job, deliberately overshooting past
+  # the table by design (see above). Revisit if a future run's raw target ever lands below this,
+  # but do not tighten it back toward table height -- that is what caused this twice already.
+  bounds_min: &bounds_min [-0.45, -0.75, 0.55]
   bounds_max: &bounds_max [0.10, 0.60, 1.2]
   sdf_voxel_size: 0.01
   vlm_camera: 0
@@ -107,10 +121,32 @@ env:
       # arm, because the arm's forward direction is its own +x. Rotating the waist to compensate
       # is not an option: joint_0's travel is +/-3.0543 rad = +/-175 deg, so a 180 deg turn is
       # just outside it. Hence the yaw below rather than a bigger joint_0 command.
-      position: [0.15, 0.0, 0.69]
+      position: [0.15, 0.0, 0.70]
       orientation: [0.0, 0.0, 1.0, 0.0]   # (x,y,z,w) -- 180 deg yaw, so local +x faces world -x
-      # z is the table top, taken from chapter 16.4's measured pen bottom (0.6993) and holder
-      # floor (0.6913). Confirm against the AABB lines environment.py prints at startup.
+      # z WAS 0.69, approximated from chapter 16.4's pen-bottom/holder-floor readings rather than
+      # measured directly -- and it was wrong. base_link's own origin is its bottom face (zero
+      # offset, confirmed by reading its aabb on the loaded robot), and table_1's own aabb top is
+      # 0.6972-0.6973, so 0.69 put the base ~0.7cm *into* the table at spawn on every load.
+      #
+      # This is not cosmetic. It reliably launched pencil_holder_1 off the table before the robot
+      # ever moved (Stage 4, observed by the user, then traced with a temporary per-step
+      # instrumentation of ReKepOGEnv.__init__): with this config, holder velocity was already
+      # nonzero (vel_z=-0.15) on the very first physics step after environment.py's own
+      # _zero_object_velocities() call, then built into a slow ~20-step drift across the table
+      # and a full free-fall once it crossed the edge. The exact same instrumentation against
+      # config.yaml (Fetch, whose mobile base never touches the table) showed holder velocity at
+      # floating-point noise (~1e-4) and zero drift over the same 40 steps -- the only difference
+      # between the two runs is this interpenetration. table_1's own root pose never visibly
+      # moved in either trace (it is far more massive than the holder), so the mechanism is almost
+      # certainly the contact solver resolving the base/table overlap and the holder/table contact
+      # together as one island, not the table itself being shoved.
+      #
+      # Fixed at the source: 0.70 clears the measured table top with ~0.3cm to spare, small enough
+      # to be irrelevant to reach (this is a world-frame shift, not a kinematic one -- the reset
+      # pose's joint angles in robots/widowxai.py do not depend on it) and large enough to absorb
+      # the run-to-run variance already seen in table_1's aabb (0.6970-0.6973). Confirm against the
+      # AABB lines environment.py prints at startup, and against base_link's own aabb if this ever
+      # needs re-deriving.
       # Required by ReKep: get_sdf_voxels() reads _ag_obj_in_hand to keep the carried object out
       # of the scene SDF, and environment.py asserts the mode is assisted or sticky.
       grasping_mode: assisted

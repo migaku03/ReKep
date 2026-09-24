@@ -4,7 +4,8 @@ Working state for `robot/widowx-ai`, written to survive a context compaction. Re
 when resuming; it is the state of *this branch*, which is why it lives here and not in the parent
 repo's `docs/`.
 
-Last updated: 2026-09-12 (bring-up complete: all four stages done, see Stage 4 attempt 2)
+Last updated: 2026-09-24 (bring-up complete: all four stages done, robot spawn height fixed, see
+Stage 4 attempt 4)
 
 ## What this is
 
@@ -350,23 +351,123 @@ condition number 17615.8. This is the fixed-base reach/layout mismatch this docu
 from the start (see "What this is" and the Stage 4 attempt-2 note below) -- not something this fix
 was meant to address.
 
+## Stage 4, attempt 4: pencil_holder_1 -- the "pre-existing scene bug" claim above was wrong
+
+The user ran attempt 3 themselves and reported two things: `pencil_holder_1` still ends up off
+the table, and the arm's motion had become noticeably fast/aggressive compared to before.
+
+**The speed increase was diagnosed first and is not a regression.** It is a direct, measured
+consequence of the grasp now succeeding: before attempt 3's grasp fix, the robot never got past a
+failed-grasp retry loop (max joint velocity across an entire run: 0.65 rad/s, `stage4_run2.log`).
+Once grasping works, the pipeline reaches stage 2 (reorientation) for the first time and drives
+hard against a target that pins `joint_4` at its own travel limit (1.5708 rad = the wrist
+singularity, `docs/sim_platform_decision.md` section 5) -- max joint velocity in that run:
+5.71 rad/s on `joint_3`, 82% of its rated 7.0 rad/s, with torque simultaneously at 91% of its
+rated 7.0 N*m. Within hardware spec, but a legitimately aggressive, near-max-effort motion; the
+user's read of it as "dangerous-looking" was correct. Not fixed (it is the same fixed-base
+reach/layout limitation already out of scope), just confirmed and explained.
+
+**The pencil holder finding above was investigated further at the user's push-back -- and turned
+out to be wrong.** The previous version of this document concluded the holder's placement was "a
+pre-existing defect in the shared scene file, unrelated to the WidowX AI work, would happen with
+Fetch too." That conclusion was based on `git diff` showing `og_scene_file_pen.json` unchanged --
+true, but insufficient: it does not establish that the *behaviour* is robot-independent, only that
+the *input file* is. Testing that assumption directly disproved it:
+
+- Loading the scene through `ReKepOGEnv` with `configs/config.yaml` (Fetch): `pencil_holder_1`
+  settles and stays exactly on the table, indefinitely.
+- Loading the identical JSON through the identical `ReKepOGEnv` path with
+  `configs/config_widowxai.yaml`: the holder ends up on the floor, every time.
+
+Same file, same loader, different outcome depending only on which robot config is passed in --
+directly contradicting "pre-existing and robot-independent." Two earlier fix attempts targeting
+the *object* both failed for this reason: nudging `pencil_holder_1`'s stored position (first a
+2.5cm margin, then 5cm) did not address whatever was actually happening, and the second attempt
+made it land even further from the table, not closer.
+
+**Root-caused with a temporary per-step instrumentation of `ReKepOGEnv.__init__`** (position,
+linear and angular velocity of `pencil_holder_1` and `table_1`, printed after every sub-step:
+`og.Environment()` construction, `_apply_appearance_overrides()`, each `_zero_object_velocities()`
+call, and every individual step of both settle loops -- removed again once the cause was found).
+Run side by side under both configs:
+
+- **Fetch**: velocity reads at floating-point noise (~1e-4) from the very first step and stays
+  there for the full 40-step settle. The holder does not move at all, to 4 decimal places.
+- **WidowX AI**: velocity is already substantial (vel_z=-0.15) on the very first step *after*
+  `_zero_object_velocities()` has just set it to exactly zero. It keeps rebuilding step over step
+  -- a slow, steady drift across the table (x moving roughly -0.30 -> -0.42 over the first 20
+  steps) -- then crosses the table's edge, loses contact entirely, and free-falls
+  (angular velocity jumps to `[-2.4, -6.1, -2.4]` rad/s at step 20; z-velocity from there matches
+  gravity almost exactly: -0.29, -0.78, -1.27, -1.76 m/s, each step roughly -0.49 m/s = g*dt).
+  Lands on the floor by step 27, and `update_initial_file()` -- called right after the settle loop
+  -- snapshots that already-fallen state as the new "initial" pose, so even `env.reset()` would
+  not recover it.
+
+`table_1`'s own reported root position never moved, in either trace, to 4 decimal places -- ruling
+out "the table visibly gets knocked" as the mechanism. What differs physically between the two
+configs, independently confirmed: the WidowX robot's `base_link` overlaps `table_1` at spawn by
+0.0073 m (`base_link` aabb z_min = 0.6900, `table_1` aabb z_max = 0.6972-0.6973). Fetch is a
+mobile base standing on the floor; it never touches the table at all. Resolving that overlap
+appears to perturb the holder's contact with the table (most plausibly via PhysX solving
+bodies that share a contact island together, so a strong correction at the base/table interface
+can also affect an unrelated body/table contact resolved in the same pass) without the table's own
+*reported* pose needing to move measurably, since it is far more massive than the holder.
+
+**Fixed at the actual source: the robot's spawn height, not the scene file.** `configs/config_widowxai.yaml`'s
+`position: [0.15, 0.0, 0.69]` used a z approximated from other objects' readings (pen bottom,
+holder floor-height) rather than a direct measurement of the table itself, and rather than the
+robot's own base geometry. The table's real aabb top is 0.6972-0.6973; `base_link`'s own origin is
+its bottom face (zero offset, confirmed on the loaded robot), so 0.69 put it 0.7cm into the table
+on every load -- silently, since nothing asserts against it. Changed to **0.70** (measured table
+top plus ~0.3cm clearance). `configs/og_scene_file_pen.json` was not touched -- both attempted
+edits to it were reverted; the file was never the problem.
+
+**Verified**, with the same `tools/check_pencil_holder_settle.py --config ./configs/config_widowxai.yaml`
+used throughout this investigation: `pencil_holder_1` now settles at its as-authored on-table
+position and stays there through 60 physics steps, untouched, matching the Fetch config's
+behaviour exactly. Also verified through a full `main.py` run: `AABB pencil_holder_1:
+z=[0.6913, 0.8162]` at startup, same as Fetch, no drift.
+
+**Second-order consequence, also fixed:** raising the base by 1cm changed the grasp-stage
+solver's typical solution enough that the previous `bounds_min` z (0.665, chosen in the prior
+attempt to clear that attempt's observed raw targets of 0.6706-0.6924) started clipping the
+descent again -- a fresh run's raw targets came back at 0.6012-0.6245, a good 4-6cm lower.
+`subgoal_solver.py` runs `dual_annealing` (a stochastic global optimiser) for the grasp pose, so
+the exact raw target varies run to run by design; chasing each new observed minimum is whack-a-mole
+against a solver that is not deterministic. Reset `bounds_min` z to a generously low,
+not-precisely-tuned **0.55** instead (roughly 15cm below the table, 55cm above the floor) --
+its job is only to stop the eef reaching somewhere absurd on a *non*-grasp move, not to shape the
+grasp descent itself, which is `_execute_grasp_action`'s job by design (see above). Re-verified
+with a full 5-minute headless run: grasp succeeds on the first attempt again
+(`ag_obj_in_hand=pen_1`), pencil holder stays on the table throughout, and as a side effect the
+Jacobian condition number during the reorientation stage improved from 17615.8 (previous run,
+`joint_4` pinned exactly at 1.5708 = the singularity) to 40.0 (`joint_4` at 1.1447, clear of it) --
+the different grasp geometry from the corrected base height leads into stage 2 from a noticeably
+better-conditioned arm configuration. The robot was even observed making contact between the pen
+and the pencil holder mid-reorientation (`contacts[robot]` listing both), i.e. visible task
+progress, though not something to read too much into yet -- still not in scope to chase further.
+
 ## Next step
 
-**Grasping now works; reorientation still does not, for the reason already on record.** The pen
-lifts cleanly on the first attempt. What remains is the stage-2 target driving `joint_4` into its
-own singularity/limit -- task-layout and workspace-bounds redesign for a bolted-down 0.7 m arm,
-which was out of scope for this bring-up from the start (see "What this is") and still is.
+**Bring-up remains done as scoped, now on firmer ground.** All four stages are green, the grasp
+succeeds reliably, and the pencil-holder scene defect turned out to be a bug in this branch's own
+robot placement (now fixed) rather than a pre-existing, unrelated issue (the previous, wrong,
+conclusion). `configs/og_scene_file_pen.json` has never needed to change and is confirmed
+byte-identical to `port/behavior1k-v3.7.2` throughout this document's history.
 
-If that redesign is picked up next:
-- Start from the joint-limit pin-out above rather than from scratch: `joint_2`-`joint_4` hitting
-  their limits at the stage-2 target suggests the current `bounds_min`/`bounds_max` (and possibly
-  the base `position` in `configs/config_widowxai.yaml`) reach past what this arm can actually
-  cover from where it is bolted down. `tools/analyze_wxai_kinematics.py` (parent repo) already has
-  the machinery to map out the real reachable envelope rather than guessing new bounds by trial
-  and error.
-- Separately, `configs/og_scene_file_pen.json`'s `pencil_holder_1` placement (off the table edge
-  at scene load, see above) needs fixing if the pencil-holder part of the task matters going
-  forward -- it is shared with the Fetch config, so fixing it affects both robots.
+What remains out of scope, unchanged from before: stage 2's reorientation target still needs more
+than this arm's workspace comfortably offers from its current mounting position, driving `joint_4`
+toward (not always onto, per the last run) its own singularity. If that redesign is picked up
+next, start from the joint-limit pin-out already on record (`joint_2`-`joint_4` hitting their
+limits at the stage-2 target) rather than from scratch -- `tools/analyze_wxai_kinematics.py`
+(parent repo) already has the machinery to map out the real reachable envelope rather than
+guessing new bounds by trial and error.
+
+One methodological note worth carrying forward: `git diff` showing a shared file unchanged proves
+the *input* didn't change; it does not prove the *behaviour* is robot-independent when robot
+placement is a variable that can disturb shared scene state through physics. When a shared-looking
+resource misbehaves only under one config, test that directly (same loader, both configs) before
+concluding it is pre-existing and unrelated.
 
 ## Reference: the seven incompatibilities found so far
 
