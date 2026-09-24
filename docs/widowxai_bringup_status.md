@@ -4,8 +4,8 @@ Working state for `robot/widowx-ai`, written to survive a context compaction. Re
 when resuming; it is the state of *this branch*, which is why it lives here and not in the parent
 repo's `docs/`.
 
-Last updated: 2026-09-24 (bring-up complete: all four stages done, robot spawn height fixed, see
-Stage 4 attempt 4)
+Last updated: 2026-09-24 (bring-up complete: grasp holds reliably, stalls afterward at a joint
+limit -- known, out-of-scope cause; task-object/table scale measured. See Stage 4 attempts 4-5.)
 
 ## What this is
 
@@ -447,21 +447,77 @@ better-conditioned arm configuration. The robot was even observed making contact
 and the pencil holder mid-reorientation (`contacts[robot]` listing both), i.e. visible task
 progress, though not something to read too much into yet -- still not in scope to chase further.
 
+## Stage 4, attempt 5: holds the pen, then stalls at a joint limit -- same known cause, calmer failure
+
+User ran the fixed build themselves: pencil holder now stays on the table (confirmed), grasp
+succeeds, but the arm goes still after grasping and never progresses further. Reproduced headless
+(5-minute run, `stage4_run6.log`) to check whether this was the same singularity fight as before or
+something new.
+
+**Same underlying limitation, different (safer) failure mode.** The grasp succeeds on the first
+attempt (`ag_obj_in_hand=pen_1`) and the run never backtracks even once afterward -- it stays in
+stage 2 (reorientation) for the rest of the 5 minutes, 95 separate "OSC pose not reached" stalls,
+with `eef travelled` per batch shrinking from ~12cm right after the grasp down to 0.04-0.05cm and
+staying there. The joint state explains why: `joint_2` sits exactly at its upper limit (2.3562)
+and `joint_3` exactly at its lower limit (-1.5708), both essentially motionless (`vel` ~0.0005-0.001
+rad/s) for the rest of the run. Unlike the earlier post-grasp run (bounds_min=0.665, base
+z=0.69, `docs` "Stage 4 attempt 3"), effort stays low here (`eff_norm` ~0.006-0.01, nowhere near
+saturated) and the Jacobian condition number holds at ~34 (nowhere near singular) -- so this is not
+the arm straining against a singularity, it is the arm sitting calmly at the edge of what it can
+reach while holding the pen roughly 10-16cm above the table (`pen_1 aabb z=[0.80,0.86]`,
+table top 0.697), unable to find a joint-limit-respecting path toward whatever stage 2's target
+keeps asking for.
+
+This is the same, already-documented, already-out-of-scope limitation (fixed-base reach vs. a task
+layout authored for Fetch's mobile base and lifting torso) surfacing in a new but unsurprising
+shape now that the grasp itself works reliably. Not investigated further or fixed -- it is squarely
+the task-layout redesign work this bring-up was scoped to stop short of.
+
+## Object and robot scale, measured (`tools/measure_scene_scale.py`)
+
+User's separate observation, that the robot and the task objects look mismatched in size, was
+checked directly rather than eyeballed:
+
+| | measured | real-world reference |
+|---|---|---|
+| `table_1` | 102.2 x 241.0 cm, 69.7 cm tall | a 241 cm span is closer to a banquet table than a desk (~120-160 cm) |
+| `pen_1` | 3.1 x 2.7 cm thick, 24.3 cm long | a real pen is ~1 cm thick, ~14-15 cm long -- roughly 3x too thick, 1.6x too long |
+| `pencil_holder_1` | 16.0 x 16.1 cm footprint, 12.5 cm tall | a real pencil cup is ~8-10 cm diameter -- roughly 1.6-2x too wide |
+| WidowX AI | base footprint 7.0 x 6.5 cm; kinematic reach 0.833 m (`tools/analyze_wxai_kinematics.py`, parent repo) | vendor-rated reach 0.700 m -- the robot's own dimensions check out against spec |
+
+**The robot is not undersized -- the task objects are oversized for it.** `pen_1` and
+`pencil_holder_1` are BEHAVIOR-1K dataset models, scaled for a household scene built around a
+human-scale mobile manipulator (Fetch); git history confirms this deliberately (`81b41ea`,
+"Restore the pen to the size the demo was built around" -- the pen was intentionally scaled *up*
+from its native size at some point before this branch existed, presumably for Fetch-scale
+visibility/graspability). Dropped into a desktop-scale fixed arm whose own reach matches its real
+hardware spec exactly, both the objects and the 241 cm table read as oversized by comparison. This
+is the same table/workspace mismatch already on record above, now with hard numbers rather than an
+impression -- and, like the reach limitation, it is task-layout work, not something this bring-up
+fixes.
+
 ## Next step
 
-**Bring-up remains done as scoped, now on firmer ground.** All four stages are green, the grasp
-succeeds reliably, and the pencil-holder scene defect turned out to be a bug in this branch's own
-robot placement (now fixed) rather than a pre-existing, unrelated issue (the previous, wrong,
-conclusion). `configs/og_scene_file_pen.json` has never needed to change and is confirmed
+**Bring-up remains done as scoped.** All four stages are green, the grasp succeeds reliably and
+repeatably, and the pencil-holder scene defect turned out to be a bug in this branch's own robot
+placement (fixed, Stage 4 attempt 4) rather than a pre-existing, unrelated issue (the earlier,
+wrong, conclusion). `configs/og_scene_file_pen.json` has never needed to change and is confirmed
 byte-identical to `port/behavior1k-v3.7.2` throughout this document's history.
 
-What remains out of scope, unchanged from before: stage 2's reorientation target still needs more
-than this arm's workspace comfortably offers from its current mounting position, driving `joint_4`
-toward (not always onto, per the last run) its own singularity. If that redesign is picked up
-next, start from the joint-limit pin-out already on record (`joint_2`-`joint_4` hitting their
-limits at the stage-2 target) rather than from scratch -- `tools/analyze_wxai_kinematics.py`
-(parent repo) already has the machinery to map out the real reachable envelope rather than
-guessing new bounds by trial and error.
+What remains out of scope, unchanged and now measured rather than impressionistic: stage 2's
+reorientation target needs more workspace than this arm comfortably offers from its current
+mounting position (`joint_2`/`joint_3` pinned at their limits, attempt 5 above), and the task
+objects themselves (pen, pencil holder) plus the table are all scaled for a much larger robot than
+the one actually mounted here (measured above). Both point the same direction: a task-layout
+redesign -- new object scale and/or placement, re-derived workspace bounds, possibly a smaller
+table region actually in play -- is the next piece of work, and it is squarely out of scope for
+this bring-up (see "What this is"). If picked up next:
+- Start from the joint-limit pin-out on record (`joint_2`-`joint_4` hitting their limits at the
+  stage-2 target) rather than from scratch -- `tools/analyze_wxai_kinematics.py` (parent repo)
+  already has the machinery to map out the real reachable envelope rather than guessing new bounds
+  by trial and error.
+- The object-scale numbers above are a starting point for deciding whether to rescale
+  `pen_1`/`pencil_holder_1` down, reposition them closer to the robot, or both.
 
 One methodological note worth carrying forward: `git diff` showing a shared file unchanged proves
 the *input* didn't change; it does not prove the *behaviour* is robot-independent when robot
