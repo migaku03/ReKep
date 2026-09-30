@@ -24,6 +24,23 @@ class IKSolver:
         self.eef_name = eef_name
         self.reset_joint_pos = reset_joint_pos
         self.world2robot_homo = world2robot_homo
+        # Fixed transform from OmniGibson's eef frame to @eef_name's frame, right-multiplied onto
+        # every target. The callers all hand in poses in OmniGibson's eef convention (z out of the
+        # fingertips); WidowX AI's ee_gripper_link sits at the same point but with x out of the
+        # fingertips, so without this the orientation part of every IK query asks for a gripper
+        # rotated 90 deg from the one meant. None (Fetch, and anything not opting in) = unchanged.
+        # Set by ReKepOGEnv when joint_space_execution is on, measured on the loaded robot.
+        self.eef_to_link = None
+
+    def pose_of(self, cspace_position):
+        """Forward kinematics of @eef_name, robot base frame, as a 4x4 matrix."""
+        p = self.kinematics.pose(np.asarray(cspace_position, dtype=np.float64), self.eef_name)
+        if hasattr(p, 'matrix'):
+            return np.asarray(p.matrix())
+        M = np.eye(4)
+        M[:3, :3] = np.asarray(p.rotation.matrix())
+        M[:3, 3] = np.asarray(p.translation).reshape(3)
+        return M
 
     def solve(
         self,
@@ -51,6 +68,8 @@ class IKSolver:
         Returns:
             ik_results (lazy.lula.CyclicCoordDescentIkResult): IK result object containing the joint positions and other information.
         """
+        if self.eef_to_link is not None:
+            target_pose_homo = np.dot(target_pose_homo, self.eef_to_link)
         # convert target pose to robot base frame
         target_pose_robot = np.dot(self.world2robot_homo, target_pose_homo)
         target_pose_pos = target_pose_robot[:3, 3]

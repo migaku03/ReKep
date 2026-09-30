@@ -5,8 +5,9 @@ when resuming; it is the state of *this branch*, which is why it lives here and 
 repo's `docs/`.
 
 Last updated: 2026-09-30 (the environment incident below is **resolved** -- see
-`docs/2026-09-30_isaac_startup_crash.md`. The object-rescale work's Stage 2 settle check has now
-passed; resume at Stage 3. See "Object rescale" and "2026-09-30 environment incident" below.)
+`docs/2026-09-30_isaac_startup_crash.md`. With realistic object sizes the full pen task now
+completes -- 3/3 consecutive `[OUTCOME] SUCCESS` with `--task pen_widowxai`. See "Object rescale"
+below for everything that had to change, including a gripper whose right finger never moved.)
 
 ## What this is
 
@@ -607,7 +608,55 @@ Stage 2 is complete and verified; proceed to Stage 3 (keypoint regeneration) nex
 object-rescale plan it replaced is summarized in this document's "Object rescale" section above and
 doesn't need to be re-read from the plan file).
 
-**Stage 4 (full run) not started.**
+**Stage 3 (keypoints) and Stage 4 (full run): done -- the full task now completes, 3/3 in a row
+(runs 13-15: miss 1.08 / 2.02 / 2.18 cm, pen upright, first-try grasp, zero backtracks).**
+
+Run with `python -u main.py --use_cached_query --task pen_widowxai --config ./configs/config_widowxai.yaml`.
+Everything below is opt-in through `config_widowxai.yaml`; the Fetch path is unchanged (150 s smoke
+run after all of it: runs, grasps with both fingers, none of the new code paths fire).
+
+- **Offline reach check first** (`tools/reach_check_widowxai.py`, numpy + URDF): with realistic
+  sizes and the untouched layout, grasp / pen-upright / 20 cm-above-holder are all reachable
+  inside joint limits (drop pose margin 1.09 rad) -- so objects were not moved.
+- **Keypoints** (`vlm_query/pen_widowxai/`): 7 points placed geometrically on the settled AABBs
+  (kp0/kp1 a quarter in from each pen end, kp1 = grasp; kp2 pen middle; kp3-6 on the holder rim
+  at r=4.5 cm so their mean is the opening centre). Constraint files copied unchanged. All snap
+  within 5 mm.
+- **main.py bugs**: `--task` was ignored (`task_list['pen']` hard-coded); the "upright" verdict
+  was a fixed 0.20 m z-span, unreachable for an 18.65 cm pen (now 80% of the pen's own length).
+- **Grasp depth**: the advance is a `precise` move, "reached" within 3 cm, so the fingertips stopped
+  above a 0.97 cm pen. `grasp_standoff_ratio` 1.0 -> 0.6 (4 cm net overshoot); one more AG ray pair
+  1.9 mm from the fingertip.
+- **Stall at joint limits (stage 2 before, stage 3 now)**: OmniGibson's IK controller is one
+  Jacobian step + clip to limits, so a joint on its stop never comes back off. Replaced for this
+  robot by joint-space execution: Lula IK per waypoint (several seeds, nearest in-tolerance
+  solution), `JointController` absolute positions, trapezoidal per-joint profile (0.8 rad/s,
+  0.5 s ramp -- the first, speed-cap-only version lurched; user GUI report).
+- **Planning IK judged the wrong orientation**: callers pass OmniGibson-eef-frame poses, the Lula
+  target `ee_gripper_link` has x (not z) out of the fingertips. Fixed transform measured at load
+  (`R=[[0,0,1],[0,-1,0],[1,0,0]]`) applied to every IK query.
+- **Grasp was physically impossible yet "succeeded"** (user, GUI): the jaws closed *along* the pen.
+  Two causes. (1) Yaw was free in the grasp cost -> added a cost for the finger-separation axis
+  being perpendicular to the object's PCA long axis. (2) **The right finger never moved**: the
+  importer's `PhysxMimicJointAPI:rotY` on the prismatic `right_carriage_joint` does nothing in this
+  sim (per-step trace: left 0.039 -> 0.000, right fixed at 0.0528 = past its own limit). It was a
+  one-finger gripper; every earlier "grasp" was assisted grasping, not a pinch. `robots/widowxai.py`
+  now removes the mimic on load, gives the right carriage the left's drive and the URDF [0, 0.044]
+  limits, and drives both (Franka-style). Now closes to left 0.0016 / right 0.0099 on the pen.
+  Safety net: `max_jaw_gap` releases any assisted grasp whose object is wider across the jaws
+  than they open. (`tools/measure_finger_geometry.py` ruled out the finger colliders first.)
+- **Arm dipped to the table right after reset** (user, GUI): upstream's reset offset
+  `[0, -0.2, -0.1]` is Fetch-sized; `reset_ee_offset: [0, -0.2, 0]`.
+- **Pen dropped beside the holder** (run12): the last move reached the position but was 65 deg off
+  in orientation, and upstream releases as soon as the path queue empties. Now a release stage
+  only opens the gripper once its subgoal constraints hold (`check_goal_before_release`,
+  tolerance 0.03); otherwise it re-plans. Fired twice in run14 before a successful release.
+
+Known, not addressed: the IK diagnostic shows exact IK solutions but the arm lagging them, and
+occasionally the chosen solution is on a far branch (up to 6.0 rad away, run14) -- a big swing.
+Kit segfaults while unloading plugins at exit (after the outcome and video are written; harmless).
+The residual 1-2 cm miss is the keypoint/constraint definition (the user's reading: a demo-level
+issue), not execution.
 
 ## 2026-09-30 environment incident: RESOLVED -- see `docs/2026-09-30_isaac_startup_crash.md`
 

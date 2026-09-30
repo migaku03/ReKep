@@ -31,8 +31,25 @@ main:
   # column 2 points out of the fingertips (dot with the link_6->fingertip-midpoint direction =
   # 0.99) and column 1 is exactly the finger-separation axis (dot = 1.00). See
   # docs/widowxai_bringup_status.md.
+  #
+  # 1.0 -> 0.6 for the rescaled pen (og_scene_file_pen_widowxai.json): with no net overshoot the
+  # advance target sits at the pen's top, and _execute_grasp_action's precise move counts
+  # anything within 3 cm (environment.py pos_threshold) as reached -- so the fingertips stopped
+  # at z~0.705, above a 0.97 cm pen's top (0.7025), and every assisted-grasp ray passed over it
+  # (run1: fingers closed to 0.0, raycast_hits=[] x5). The Fetch-era 3 cm pen hid this. 0.6
+  # leaves a 4 cm net overshoot: the target lands >3 cm below the tabletop, so the move cannot
+  # count as reached until the fingertips are down on the table beside the pen.
   grasp_approach_axis: z
-  grasp_standoff_ratio: 1.0
+  grasp_standoff_ratio: 0.6
+  # Close the jaws across the grasped object's long axis (subgoal_solver.py grasp_perp_cost).
+  # Without it the solver picked a yaw that closed the fingers ALONG the pen -- see there.
+  grasp_across_long_axis: true
+  # Do not open the gripper in a release stage until that stage's subgoal constraints hold at
+  # the measured keypoints (main.py _release_goal_met); otherwise re-plan. Stage 3's are "grasp
+  # point within X of 20 cm above the holder opening" and "pen axis parallel to z" (|cross|,
+  # ~sin(tilt)*0.094 m for this grasp) -- 0.03 allows ~3 cm off the target point, ~18 deg of tilt.
+  check_goal_before_release: true
+  release_goal_tolerance: 0.03
 
   constraint_tolerance: 0.10  # for backtracking
   # Workspace box. x/y still the Fetch numbers; re-deriving those for a fixed base whose
@@ -101,6 +118,21 @@ env:
   interpolate_pos_step_size: *interpolate_pos_step_size
   interpolate_rot_step_size: *interpolate_rot_step_size
 
+  # Execute each waypoint as joint targets from a Lula IK solve (several seeds) rather than
+  # through OmniGibson's differential-IK controller, which cannot leave a joint limit once it
+  # reaches one. Needs the JointController below. Same descriptor/link as main.ik.
+  joint_space_execution: true
+  ik:
+    descriptor: widowxai_descriptor.yaml
+    eef_name: ee_gripper_link
+  # Widest object (along the finger-separation axis) the jaws can physically close on: pad inner
+  # faces at +-(0.023 carriage offset + 0.044 travel - 0.0254 pad inset) = +-0.042 m fully open,
+  # rounded up. Assisted grasps of anything wider are released (environment.py
+  # _reject_impossible_grasp) -- it had accepted a pen held lengthwise between the fingers.
+  max_jaw_gap: 0.085
+  # upstream's [0, -0.2, -0.1] put this arm's fingertips on the tabletop right after reset
+  reset_ee_offset: [0.0, -0.2, 0.0]
+
   robot:
     robot_config:
       name: WidowXAI
@@ -154,11 +186,16 @@ env:
       controller_config:
         # No base controller: nothing to drive. No trunk or camera controller either -- this arm
         # has neither, which is also why environment.py asks for trunk DOFs conditionally.
+        # Was InverseKinematicsController (pose_delta_ori). It stalled with joint_2/joint_3 on
+        # their stops whenever a target needed the arm to unfold -- see joint_space_execution
+        # below and environment.py _setup_joint_space_execution. Absolute joint positions, raw
+        # radians (both limit maps off), computed by a global IK solve per waypoint.
         arm_0:
-          name: InverseKinematicsController
-          # Default mode; the command is (dx, dy, dz, dax, day, daz) in the robot frame, which is
-          # exactly the six numbers _move_to_waypoint already builds for Fetch's OSC.
-          mode: pose_delta_ori
+          name: JointController
+          motor_type: position
+          use_delta_commands: false
+          command_input_limits: null
+          command_output_limits: null
         gripper_0:
           name: MultiFingerGripperController
           command_input_limits: [0.0, 1.0]

@@ -106,6 +106,50 @@ class WidowXAI(ManipulationRobot):
             **kwargs,
         )
 
+    def _post_load(self):
+        self._drive_right_carriage()
+        super()._post_load()
+
+    def _drive_right_carriage(self):
+        """Replace right_carriage_joint's mimic constraint with a drive of its own.
+
+        The importer turned the URDF's <mimic joint="left_carriage_joint"/> into a
+        PhysxMimicJointAPI:rotY on a *prismatic* joint (gearing -1, limits widened to
+        [-0.0088, 0.0528]), and in this simulator it does nothing: measured with a per-step
+        trace while closing on the rescaled pen, left_carriage_joint went 0.039 -> 0.000 while
+        right_carriage_joint sat at 0.0528 the whole time. So the "parallel jaw" was one finger
+        closing against a jaw stuck open past its own travel -- it cannot squeeze a 0.97 cm pen,
+        and whatever it "held" before was assisted grasping, not a pinch.
+
+        Fixed the way OmniGibson's own parallel grippers (franka.py) are modelled: both carriages
+        driven, commanded together by MultiFingerGripperController. The real arm has one motor
+        and a rack-and-pinion, which makes the two jaws move symmetrically -- the same motion.
+        Done on the loaded stage (a session-layer override), before super()._post_load() creates
+        the JointPrims -- they decide "driven" from the DriveAPI's presence. The asset file itself
+        is left alone. Right joint's frame is rotated 180 deg about x, so +y on it is outward:
+        positive = open, same as the left, and the URDF's [0, 0.044] applies to both.
+        """
+        from pxr import Usd, UsdPhysics
+
+        joints = {p.GetName(): p for p in Usd.PrimRange(self._prim)
+                  if p.GetName() in ("left_carriage_joint", "right_carriage_joint")}
+        left, right = joints["left_carriage_joint"], joints["right_carriage_joint"]
+        for schema in [s for s in right.GetAppliedSchemas() if s.startswith("PhysxMimicJointAPI")]:
+            right.RemoveAppliedSchema(schema)
+        UsdPhysics.DriveAPI.Apply(right, "linear")
+        for attr in left.GetAttributes():
+            name = attr.GetName()
+            if name.startswith("drive:linear:physics:") and attr.HasAuthoredValue():
+                dst = right.GetAttribute(name) or right.CreateAttribute(name, attr.GetTypeName(),
+                                                                        variability=attr.GetVariability())
+                dst.Set(attr.Get())
+        right.GetAttribute("physics:lowerLimit").Set(0.0)
+        right.GetAttribute("physics:upperLimit").Set(0.044)
+        maxv = left.GetAttribute("physxJoint:maxJointVelocity")
+        if maxv and maxv.HasAuthoredValue():
+            (right.GetAttribute("physxJoint:maxJointVelocity")
+             or right.CreateAttribute("physxJoint:maxJointVelocity", maxv.GetTypeName())).Set(maxv.Get())
+
     @property
     def discrete_action_list(self):
         raise NotImplementedError()
@@ -179,7 +223,11 @@ class WidowXAI(ManipulationRobot):
         # equal length. assisted_grasp_start_points is built from finger_link_names only
         # (manipulation_robot.py), and gripper_control_idx/MultiFingerGripperController accept a
         # dof_idx of any length. See docs/widowxai_bringup_status.md.
-        return {self.default_arm: ["left_carriage_joint"]}
+        #
+        # SUPERSEDED: the mimic constraint turned out not to act at all (right carriage frozen at
+        # 0.0528 while the left closed), so _drive_right_carriage() now gives the right joint its
+        # own drive and both are listed -- see there.
+        return {self.default_arm: ["left_carriage_joint", "right_carriage_joint"]}
 
     # Hand-authored assisted-grasp ray endpoints, following the pattern every end-effector option
     # in omnigibson/robots/franka.py uses. ManipulationRobot's own auto-inference
@@ -205,13 +253,21 @@ class WidowXAI(ManipulationRobot):
     # own tip (measured finger_max_z = +0.0004 m, essentially zero), so there is no room in front
     # of z=0 to straddle. Dropped that clamp in favour of two points spanning the same 20%-95%
     # window of the finger's own physical length measured from its base at link_6.
+    #
+    # Third pair (0.0680, ~97.5% of the finger's length, ~1.9 mm behind the fingertip): added for
+    # the rescaled pen scene (og_scene_file_pen_widowxai.json), where pen_1 is its real 0.97 cm
+    # thick. Lying on the table its top is only ~5 mm above the fingertips' lowest reach, so the
+    # 95% pair -- 3.8 mm behind the tip -- only just grazes it, and nothing else is low enough.
+    # The Fetch-era fat pen (~3 cm) hid this. Extra rays only add hit chances.
     _ag_start_points = [
         GraspingPoint(link_name="gripper_left", position=th.tensor([0.00918, -0.02536, 0.0])),
         GraspingPoint(link_name="gripper_left", position=th.tensor([0.06614, -0.02536, 0.0])),
+        GraspingPoint(link_name="gripper_left", position=th.tensor([0.06800, -0.02536, 0.0])),
     ]
     _ag_end_points = [
         GraspingPoint(link_name="gripper_right", position=th.tensor([0.00918, 0.02536, 0.0])),
         GraspingPoint(link_name="gripper_right", position=th.tensor([0.06611, 0.02536, 0.0])),
+        GraspingPoint(link_name="gripper_right", position=th.tensor([0.06800, 0.02536, 0.0])),
     ]
 
     @property

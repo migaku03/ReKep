@@ -55,6 +55,11 @@ class Main:
             reset_joint_pos=self.env.reset_joint_pos,
             world2robot_homo=self.env.world2robot_homo,
         )
+        # same eef -> IK-link correction the executor uses (environment.py
+        # _setup_joint_space_execution), so the reachability cost judges the orientation that
+        # will actually be commanded. Only set where measured; Fetch keeps its old behaviour.
+        if getattr(self.env, 'joint_space_execution', False):
+            ik_solver.eef_to_link = self.env.eef_to_ik_link
         # initialize solvers
         self.subgoal_solver = SubgoalSolver(global_config['subgoal_solver'], ik_solver, self.env.reset_joint_pos)
         self.path_solver = PathSolver(global_config['path_solver'], ik_solver, self.env.reset_joint_pos)
@@ -64,6 +69,11 @@ class Main:
 
     def perform_task(self, instruction, rekep_program_dir=None, disturbance_seq=None):
         self.env.reset()
+        # the pen lies flat after reset, so its longest AABB axis is its length (_report_outcome)
+        _pen = self.env.og_env.scene.object_registry("name", "pen_1")
+        if _pen is not None:
+            _lo, _hi = (T.to_numpy(v) for v in _pen.aabb)
+            self._pen_length = float(np.max(_hi - _lo))
         cam_obs = self.env.get_cam_obs()
         rgb = cam_obs[self.config['vlm_camera']]['rgb']
         points = cam_obs[self.config['vlm_camera']]['points']
@@ -108,9 +118,14 @@ class Main:
         inserted = bool(p_lo[2] < h_hi[2])
         # centred: the pen's horizontal centre lies within the holder's footprint
         centred = bool(np.all(pen_xy >= h_lo[:2]) and np.all(pen_xy <= h_hi[:2]))
-        # upright: a 24.24 cm pen standing up spans most of that in z; lying down it spans ~3 cm
+        # upright: a pen standing up spans most of its length in z; lying down only its thickness.
+        # The threshold was a fixed 0.20 m, written for the Fetch scene's 24.24 cm pen -- the
+        # rescaled WidowX AI scene's 18.65 cm pen could never pass it even standing perfectly
+        # upright. Scale it to the pen actually loaded: 80% of its longest AABB axis at spawn
+        # (lying flat, so that axis is its length) -- 0.194 m for the Fetch pen, same verdicts.
         span_z = float(p_hi[2] - p_lo[2])
-        upright = bool(span_z > 0.20)
+        pen_len = getattr(self, '_pen_length', None) or 0.2424
+        upright = bool(span_z > 0.8 * pen_len)
 
         print(f"[OUTCOME] pen   aabb z=[{p_lo[2]:.4f}, {p_hi[2]:.4f}] xy_centre=[{pen_xy[0]:.4f}, {pen_xy[1]:.4f}]", flush=True)
         print(f"[OUTCOME] holder aabb z=[{h_lo[2]:.4f}, {h_hi[2]:.4f}] "
@@ -125,10 +140,32 @@ class Main:
         print(f"[OUTCOME]   inserted (pen bottom {p_lo[2]:.4f} < rim {h_hi[2]:.4f}): {inserted}"
               f"   <- only meaningful with centred", flush=True)
         print(f"[OUTCOME]   centred  (xy centre inside holder footprint):           {centred}", flush=True)
-        print(f"[OUTCOME]   upright  (z span {span_z * 100:.2f} cm > 20 cm):           {upright}", flush=True)
+        print(f"[OUTCOME]   upright  (z span {span_z * 100:.2f} cm > {80 * pen_len:.1f} cm):         {upright}", flush=True)
         ok = inserted and centred and upright
         colour = bcolors.OKGREEN if ok else bcolors.FAIL
         print(f"{colour}[OUTCOME] {'SUCCESS' if ok else 'FAILURE'}{bcolors.ENDC}", flush=True)
+
+    def _release_goal_met(self):
+        """Opt-in (config main.check_goal_before_release): only let go once this stage's subgoal
+        constraints actually hold at the measured keypoints.
+
+        Upstream releases as soon as the path's action queue is empty, whether or not the arm got
+        where the path was going. On the rescaled WidowX AI scene one run (run12) finished its
+        last move with the position right (0.8 mm) but the gripper 65 deg off, so the pen was
+        not vertical -- and the release dropped it 17 cm wide of the holder. Every earlier
+        failure that ended with the pen lying beside the holder looks the same way.
+        """
+        if not self.config.get('check_goal_before_release', False):
+            return True
+        kps = np.concatenate([[self.env.get_ee_pos()], self.env.get_keypoint_positions()], axis=0)
+        violations = [float(c(kps[0], kps[1:])) for c in self.constraint_fns[self.stage]['subgoal']]
+        tol = self.config['release_goal_tolerance']
+        ok = all(v <= tol for v in violations)
+        self._release_checks = getattr(self, '_release_checks', 0) + 1
+        print(f"[RELEASE CHECK] #{self._release_checks} subgoal violations "
+              f"{np.round(violations, 4).tolist()} (tol {tol}) -> {'release' if ok else 'NOT YET, re-plan'}",
+              flush=True)
+        return ok
 
     def _update_disturbance_seq(self, stage, disturbance_seq):
         if disturbance_seq is not None:
@@ -223,6 +260,9 @@ class Main:
                     self.env.execute_action(next_action, precise=precise)
                     count += 1
                 if len(self.action_queue) == 0:
+                    if self.is_release_stage and not self._release_goal_met():
+                        # re-plan from wherever the arm actually got to, instead of dropping
+                        continue
                     if self.is_grasp_stage:
                         self._execute_grasp_action()
                     elif self.is_release_stage:
@@ -241,6 +281,14 @@ class Main:
     def _get_next_subgoal(self, from_scratch):
         subgoal_constraints = self.constraint_fns[self.stage]['subgoal']
         path_constraints = self.constraint_fns[self.stage]['path']
+        # opt-in (config main.grasp_across_long_axis): make the grasp close across the target
+        # object's long axis -- see grasp_perp_cost in subgoal_solver.py
+        grasp_obj_axis = None
+        if self.is_grasp_stage and self.config.get('grasp_across_long_axis', False):
+            grasp_obj = self.env.get_object_by_keypoint(self.program_info['grasp_keypoints'][self.stage - 1])
+            grasp_obj_axis = self.env.get_object_long_axis(grasp_obj)
+            print(f"[GRASP AXIS] {grasp_obj.name} long axis = "
+                  f"{None if grasp_obj_axis is None else np.round(grasp_obj_axis, 3).tolist()}", flush=True)
         subgoal_pose, debug_dict = self.subgoal_solver.solve(self.curr_ee_pose,
                                                             self.keypoints,
                                                             self.keypoint_movable_mask,
@@ -250,7 +298,8 @@ class Main:
                                                             self.collision_points,
                                                             self.is_grasp_stage,
                                                             self.curr_joint_pos,
-                                                            from_scratch=from_scratch)
+                                                            from_scratch=from_scratch,
+                                                            grasp_obj_axis=grasp_obj_axis)
         subgoal_pose_homo = T.convert_pose_quat2mat(subgoal_pose)
         # if grasp stage, back up a bit to leave room for grasping.
         #
@@ -513,7 +562,7 @@ if __name__ == "__main__":
             'rekep_program_dir': './vlm_query/pen_widowxai',
             },
     }
-    task = task_list['pen']
+    task = task_list[args.task]
     scene_file = task['scene_file']
     instruction = task['instruction']
     main = Main(scene_file, visualize=args.visualize, config_path=args.config)

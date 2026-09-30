@@ -156,6 +156,81 @@ class ReKepOGEnv:
         # initialize cameras
         self._initialize_cameras(self.config['camera'])
         self.last_og_gripper_action = 1.0
+        self._setup_joint_space_execution()
+
+    def _setup_joint_space_execution(self):
+        """Opt-in (env config `joint_space_execution: true`): execute waypoints as joint targets
+        from a global IK solve, instead of stepping OmniGibson's InverseKinematicsController.
+
+        That controller is one damped-least-squares step through the Jacobian followed by a clip
+        to the joint limits (omnigibson/controllers/ik_controller.py). Once a joint reaches its
+        stop there is nothing that moves it back off, so a target that needs the arm to *unfold*
+        is unreachable from a folded configuration even though a perfectly good configuration
+        for it exists elsewhere. On the WidowX AI that is exactly how the pen task stalled, twice:
+        joint_2 on its upper stop and joint_3 on its lower stop, eef not moving (Stage 4 attempt 5
+        in stage 2, and the rescaled scene's first run in stage 3 -- whose target, 20 cm above
+        the holder, tools/reach_check_widowxai.py shows reachable with a 1.09 rad limit margin).
+        Lula IK searches configuration space from several seeds, so it is not trapped that way.
+
+        The arm controller must then be a JointController taking absolute positions
+        (config_widowxai.yaml). Fetch does not set the flag and runs exactly as before.
+        """
+        self.joint_space_execution = bool(self.config.get('joint_space_execution', False))
+        self._q_cmd = None
+        if not self.joint_space_execution:
+            return
+        from ik_solver import IKSolver
+        ik_cfg = self.config['ik']
+        self.exec_ik = IKSolver(
+            robot_description_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), 'configs', ik_cfg['descriptor']),
+            robot_urdf_path=self.robot.urdf_path,
+            eef_name=ik_cfg['eef_name'],
+            reset_joint_pos=self.reset_joint_pos,
+            world2robot_homo=self.world2robot_homo,
+        )
+        # eef -> IK link, measured rather than assumed: FK of the IK link at the current joints
+        # against where OmniGibson says its eef is at those same joints, both in the base frame.
+        q = self.get_arm_joint_postions()
+        T_link = self.exec_ik.pose_of(q)
+        T_eef = T.pose2mat((T.to_numpy(self.robot.get_relative_eef_position()),
+                            T.to_numpy(self.robot.get_relative_eef_orientation())))
+        self.eef_to_ik_link = np.dot(T.pose_inv(T_eef), T_link)
+        self.exec_ik.eef_to_link = self.eef_to_ik_link
+        lo = T.to_numpy(self.robot.joint_lower_limits)[self._planning_dof_idx()]
+        hi = T.to_numpy(self.robot.joint_upper_limits)[self._planning_dof_idx()]
+        self._arm_limits = (lo, hi)
+        print(f"[environment.py] joint-space execution on; eef->{ik_cfg['eef_name']} offset: "
+              f"t={np.round(self.eef_to_ik_link[:3, 3], 4).tolist()} "
+              f"R={np.round(self.eef_to_ik_link[:3, :3], 3).tolist()}", flush=True)
+
+    def _solve_joint_target(self, target_pose_world):
+        """Global IK for one waypoint. Several seeds; of the solutions that meet tolerance, the
+        one nearest the current joints (so the arm does not flip branches between waypoints).
+        If none does, the best-effort result with the smallest position error."""
+        q_cur = self.get_arm_joint_postions()
+        lo, hi = self._arm_limits
+        seeds = [q_cur, self.reset_joint_pos]
+        if self._q_cmd is not None:
+            seeds.insert(1, self._q_cmd)
+        rng = np.random.default_rng(self.step_counter)
+        seeds += [rng.uniform(lo, hi) for _ in range(6)]
+        target_homo = T.convert_pose_quat2mat(target_pose_world)
+        best_ok, best_any = None, None
+        for seed in seeds:
+            r = self.exec_ik.solve(target_homo, position_tolerance=0.005, orientation_tolerance=0.05,
+                                   orientation_weight=0.5, max_iterations=200, initial_joint_pos=seed)
+            q = np.clip(np.asarray(r.cspace_position, dtype=float), lo, hi)
+            if r.success:
+                d = float(np.linalg.norm(q - q_cur))
+                if best_ok is None or d < best_ok[0]:
+                    best_ok = (d, q)
+            ori_err = max(float(getattr(r, f'{a}_axis_orientation_error', 0.0)) for a in 'xyz')
+            err = float(r.position_error) + 0.1 * ori_err
+            if best_any is None or err < best_any[0]:
+                best_any = (err, q)
+        if best_ok is not None:
+            return best_ok[1], True
+        return best_any[1], False
 
     def _zero_object_velocities(self):
         """
@@ -216,8 +291,16 @@ class ReKepOGEnv:
                   f"{', reflection blanked' if spec.get('matte') else ''}", flush=True)
 
     def _empty_action(self):
-        """Zero action vector sized to the robot's actual action space."""
-        return np.zeros(self.robot.action_dim)
+        """Zero action vector sized to the robot's actual action space.
+
+        Zero means "hold" only for a delta controller. Under joint_space_execution the arm takes
+        absolute joint positions, where zero would fling the arm to its all-zeros pose on every
+        gripper open/close -- so hold the last commanded (or, before any, the current) joints.
+        """
+        action = np.zeros(self.robot.action_dim)
+        if getattr(self, 'joint_space_execution', False):
+            action[self.arm_action_idx] = self._q_cmd if self._q_cmd is not None else self.get_arm_joint_postions()
+        return action
 
     def _planning_dof_idx(self):
         """DOF indices of the joints ReKep plans over: the trunk, if there is one, plus the arm.
@@ -442,15 +525,69 @@ class ReKepOGEnv:
         collision_points = np.concatenate(collision_points, axis=0)
         return collision_points
 
+    def _object_surface_points(self, obj, n_per_mesh=1000):
+        """World-frame points sampled on @obj's collision meshes, or None if it has none."""
+        pts = []
+        for link in obj.links.values():
+            for mesh in link.collision_meshes.values():
+                if mesh.prim.GetPrimTypeInfo().GetTypeName() == 'Mesh':
+                    tm = mesh_prim_mesh_to_trimesh_mesh(mesh.prim)
+                else:
+                    tm = mesh_prim_shape_to_trimesh_mesh(mesh.prim)
+                tm.apply_transform(PoseAPI.get_world_pose_with_scale(mesh.prim_path))
+                pts.append(tm.sample(n_per_mesh))
+        return np.concatenate(pts, axis=0) if pts else None
+
+    def _reject_impossible_grasp(self):
+        """Opt-in (env config `max_jaw_gap`, metres): undo an assisted grasp the jaws could not
+        physically make. Assisted grasping latches onto anything a finger ray hits while a finger
+        touches it, so it will "hold" a pen whose length runs between the fingers -- which no
+        real parallel gripper can. Measure the object's extent along the finger-separation axis
+        (eef y) and release it if that is wider than the jaws open."""
+        max_gap = self.config.get('max_jaw_gap')
+        arm = self.robot.default_arm
+        obj = self.robot._ag_obj_in_hand[arm]
+        if max_gap is None or obj is None:
+            return
+        pts = self._object_surface_points(obj)
+        if pts is None:
+            return
+        sep_axis = T.quat2mat(self.get_ee_quat())[:, 1]
+        proj = pts @ sep_axis
+        width = float(proj.max() - proj.min())
+        if width > max_gap:
+            print(f"[GRASP] REJECTED {obj.name}: {width * 100:.1f} cm across the jaws > max jaw gap "
+                  f"{max_gap * 100:.1f} cm -- not a physically possible grasp, releasing", flush=True)
+            self.robot.release_grasp_immediately()
+        else:
+            print(f"[GRASP] {obj.name}: {width * 100:.1f} cm across the jaws (max {max_gap * 100:.1f} cm) ok", flush=True)
+
+    def get_object_long_axis(self, obj, min_elongation=2.0):
+        """World-frame unit vector along @obj's longest principal axis (PCA of its collision
+        mesh surface), or None if it is not clearly elongated (longest/second spread below
+        @min_elongation) -- a cup or a box has no single axis the jaws must close across."""
+        pts = self._object_surface_points(obj)
+        if pts is None:
+            return None
+        evals, evecs = np.linalg.eigh(np.cov((pts - pts.mean(axis=0)).T))
+        if np.sqrt(evals[-1] / max(evals[-2], 1e-12)) < min_elongation:
+            return None
+        return evecs[:, -1]
+
     def reset(self):
         self.og_env.reset()
         self._zero_object_velocities()  # og_env.reset() restores poses but not velocities
         self.robot.reset()
+        self._q_cmd = None  # hold wherever reset put the arm, not the pre-reset command
+        self._dq = None
         for _ in range(5): self._step()
         self.open_gripper()
         # moving arm to the side to unblock view 
         ee_pose = self.get_ee_pose()
-        ee_pose[:3] += np.array([0.0, -0.2, -0.1])
+        # [0, -0.2, -0.1] is upstream's, sized for Fetch. On the WidowX AI the reset eef is only
+        # ~10 cm above the table, so the -0.1 drove the fingertips down to the tabletop (eef
+        # z=0.705) before the task had even started. Configurable; default = upstream.
+        ee_pose[:3] += np.array(self.config.get('reset_ee_offset', [0.0, -0.2, -0.1]))
         action = np.concatenate([ee_pose, [self.get_gripper_null_action()]])
         self.execute_action(action, precise=True)
         self.video_cache = []
@@ -494,7 +631,9 @@ class ReKepOGEnv:
         for _ in range(30):
             self._step(action)
         self.last_og_gripper_action = 0.0
+        self._dq = None  # the arm held still while the jaws moved
         self._report_grasp_state()
+        self._reject_impossible_grasp()
 
     def _report_grasp_state(self):
         """Temporary diagnostic: why does assisted grasping not latch onto the pen?"""
@@ -614,6 +753,7 @@ class ReKepOGEnv:
         for _ in range(30):
             self._step(action)
         self.last_og_gripper_action = 1.0
+        self._dq = None  # the arm held still while the jaws moved
 
     def get_last_og_gripper_action(self):
         return self.last_og_gripper_action
@@ -758,6 +898,11 @@ class ReKepOGEnv:
         rot_errors = []
         count = 0
         start_eef = T.to_numpy(self.robot.get_relative_eef_position())
+        if getattr(self, 'joint_space_execution', False):
+            q_target, ik_ok = self._solve_joint_target(target_pose_world)
+            if not ik_ok:
+                print(f"[WP] IK found no in-tolerance solution for "
+                      f"{np.round(target_pose_world[:3], 4).tolist()}; using best effort", flush=True)
         while count < max_steps:
             reached, pos_error, rot_error = self._check_reached_ee(target_pose_world[:3], target_pose_world[3:7], pos_threshold, rot_threshold)
             pos_errors.append(pos_error)
@@ -783,6 +928,26 @@ class ReKepOGEnv:
             # indices are queried from the robot in __init__ rather than assumed here. What must
             # hold either way is that the arm controller takes exactly six -- that is asserted
             # once, at construction.
+            if getattr(self, 'joint_space_execution', False):
+                # Walk the commanded joints toward the IK solution with a per-joint trapezoidal
+                # profile. A plain speed cap (the first version, 0.06 rad/step) still jumped from
+                # rest to full speed in one step and looked like a lurch (user, GUI run). Now:
+                # speed <= V (rad/step), change of speed <= A per step, and speed <= sqrt(2*A*d)
+                # so each joint decelerates into its target. V=0.04 -> 0.8 rad/s at 20 Hz; A=0.004
+                # -> 0.5 s to full speed. The velocity carries over between waypoints, so a dense
+                # path is followed without stopping at every point.
+                V, A = 0.04, 0.004
+                base = self._q_cmd if self._q_cmd is not None else self.get_arm_joint_postions()
+                dq_prev = self._dq if getattr(self, '_dq', None) is not None else np.zeros_like(base)
+                d = q_target - base
+                v_des = np.sign(d) * np.minimum(np.minimum(np.abs(d), V), np.sqrt(2 * A * np.abs(d)))
+                self._dq = np.clip(v_des, dq_prev - A, dq_prev + A)
+                self._q_cmd = base + self._dq
+                action = self._empty_action()
+                action[self.gripper_action_idx] = self.last_og_gripper_action
+                _ = self._step(action=action)
+                count += 1
+                continue
             action = self._empty_action()  # anything that is not arm or gripper stays at zero
             action[self.arm_action_idx[:3]] = relative_position
             action[self.arm_action_idx[3:]] = relative_axisangle
@@ -800,6 +965,16 @@ class ReKepOGEnv:
                   f'over those {max_steps} steps{bcolors.ENDC}', flush=True)
             if travelled < 0.02 or max_steps >= 60:
                 self._report_stall(target_pose_world, tag=f" {max_steps}st")
+            if getattr(self, 'joint_space_execution', False):
+                # was the IK answer itself wrong, or did the arm fail to get to a right answer?
+                T_goal = np.dot(np.dot(self.world2robot_homo, T.convert_pose_quat2mat(target_pose_world)),
+                                self.eef_to_ik_link)
+                T_fk = self.exec_ik.pose_of(q_target)
+                fk_rot = np.rad2deg(angle_between_rotmat(T_fk[:3, :3], T_goal[:3, :3]))
+                q_now = self.get_arm_joint_postions()
+                print(f"[WP] ik_ok={ik_ok} IK-solution error vs target: pos {np.linalg.norm(T_fk[:3, 3] - T_goal[:3, 3]):.4f} m "
+                      f"rot {fk_rot:.1f} deg | joints now-vs-target max {np.abs(q_now - q_target).max():.3f} rad "
+                      f"q_target={np.round(q_target, 3).tolist()} q_now={np.round(q_now, 3).tolist()}", flush=True)
 
     def _step(self, action=None):
         _t_enter = time.perf_counter()  # [STEP TIMING]

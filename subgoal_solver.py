@@ -25,6 +25,7 @@ def objective(opt_vars,
             initial_joint_pos,
             reset_joint_pos,
             is_grasp_stage,
+            grasp_obj_axis=None,
             return_debug_dict=False):
 
     debug_dict = {}
@@ -74,6 +75,17 @@ def objective(opt_vars,
         # so it comes at the object edge-on and the assisted-grasp rays never cross it.
         grasp_cost = -np.dot(opt_pose_homo[:3, 2], preferred_dir) + 1  # [0, 1]
         grasp_cost = 10.0 * grasp_cost
+        # Close the jaws ACROSS an elongated object, not along it. The term above only asks for
+        # a top-down approach and leaves the yaw free, so on the rescaled WidowX AI scene the
+        # solver closed the fingers along the pen's length -- physically impossible for an
+        # 18.65 cm pen and a ~8 cm jaw, yet assisted grasping accepted it (a ray down the pen's
+        # axis hits the pen; fingers stopped at 0.041 of 0.044, i.e. barely closed). Column 1 is
+        # the finger-separation axis (tools/check_widowxai.py). Only when the caller supplies the
+        # object's long axis (main.py, from its mesh), so the Fetch runs are unchanged.
+        if grasp_obj_axis is not None:
+            perp_cost = 10.0 * abs(float(np.dot(opt_pose_homo[:3, 1], grasp_obj_axis)))
+            debug_dict['grasp_perp_cost'] = perp_cost
+            grasp_cost += perp_cost
         debug_dict['grasp_cost'] = grasp_cost
         cost += grasp_cost
 
@@ -189,6 +201,7 @@ class SubgoalSolver:
             is_grasp_stage,
             initial_joint_pos,
             from_scratch=False,
+            grasp_obj_axis=None,
             ):
         """
         Args:
@@ -244,7 +257,8 @@ class SubgoalSolver:
                     self.ik_solver,
                     initial_joint_pos,
                     self.reset_joint_pos,
-                    is_grasp_stage)
+                    is_grasp_stage,
+                    grasp_obj_axis)
 
         # ====================================
         # = solve optimization
