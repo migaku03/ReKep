@@ -4,9 +4,9 @@ Working state for `robot/widowx-ai`, written to survive a context compaction. Re
 when resuming; it is the state of *this branch*, which is why it lives here and not in the parent
 repo's `docs/`.
 
-Last updated: 2026-09-30 (object-rescale work started -- scene forked, pen/holder/table scaled to
-real-world sizes -- then blocked before any verification run by a machine-level Isaac Sim startup
-failure unrelated to this branch. See "Object rescale" and "2026-09-30 environment incident" below.)
+Last updated: 2026-09-30 (the environment incident below is **resolved** -- see
+`docs/2026-09-30_isaac_startup_crash.md`. The object-rescale work's Stage 2 settle check has now
+passed; resume at Stage 3. See "Object rescale" and "2026-09-30 environment incident" below.)
 
 ## What this is
 
@@ -575,10 +575,72 @@ dimensions without eyeballing. Findings:
   `tools/check_pencil_holder_settle.py` modified, `configs/og_scene_file_pen_widowxai.json` and
   `tools/measure_native_scale.py` untracked.
 
-**Stage 3 (keypoint regeneration) and Stage 4 (full run) not started** -- blocked before Stage 2's
-own verification could run. See the plan file for what they involve.
+**Stage 2 verification: now done, passed.** Ran after the h5py fix (`docs/2026-09-30_isaac_startup_crash.md`)
+resolved the environment incident. One gotcha worth recording: the first attempt appeared to
+produce no script output at all (just Kit's own log, ending in "Simulation App Shutting Down") --
+this was **not** a repeat of the hang, it was stdout buffering: `check_pencil_holder_settle.py`'s
+`print()` calls have no `flush=True`, and when stdout is redirected to a file (fully buffered, not
+line-buffered) plus the process exits however `SimulationApp.close()` ultimately does, the buffered
+script output never reaches the file. Re-ran with `python -u` (unbuffered) and the output was all
+there. **Worth doing for any future headless repro on this branch** -- use `python -u`, or don't
+trust an "empty output" result at face value without checking for this first.
 
-## 2026-09-30 environment incident: Isaac Sim will not start at all on this machine right now
+Actual result, `python -u tools/check_pencil_holder_settle.py --config ./configs/config_widowxai.yaml --scene_file ./configs/og_scene_file_pen_widowxai.json`:
+
+```
+table_1 (after ReKepOGEnv load): pos=[0.1382, -0.0202, 0.6463] aabb x=[-0.3710,0.6423] y=[-0.7258,0.6840] z=[-0.0000,0.6970]
+pencil_holder_1 (after ReKepOGEnv load): pos=[-0.2975, 0.1511, 0.746] aabb x=[-0.3507,-0.2443] y=[0.0971,0.2051] z=[0.6908,0.8157]
+pen_1 (after ReKepOGEnv load): pos=[-0.2608, -0.1754, 0.6974] aabb x=[-0.2658,-0.2555] y=[-0.2603,-0.0736] z=[0.6928,0.7025]
+robot: type=WidowXAI pos=[0.15, 0.0, 0.7]
+robot base_link aabb: ... vs table z-overlap: -0.0030 m (clear)
+pencil_holder_1 (after 60 more steps): pos=[-0.2975, 0.1511, 0.746] aabb ... z=[0.6908,0.8157]   <- unchanged
+pen_1 (after 60 more steps): pos=[-0.2608, -0.1754, 0.6974] aabb ... z=[0.6928,0.7025]            <- unchanged
+```
+
+Both rescaled objects settle immediately and stay put through 60 extra physics steps (zero
+drift) -- the pencil holder doesn't fall, the now-much-thinner pen doesn't roll or tip. Table's new
+narrower y-extent (`y=[-0.726,0.684]`, was `[-1.227,1.183]`) still comfortably contains both
+objects, as reasoned in Stage 2.2 above. No robot/table interpenetration. **Object-rescale plan's
+Stage 2 is complete and verified; proceed to Stage 3 (keypoint regeneration) next** -- see
+`C:\Users\smiga\.claude\plans\lucky-splashing-lobster.md` (note: that plan file currently holds the
+*environment-diagnosis* plan from the hang investigation, superseded now that it's resolved; the
+object-rescale plan it replaced is summarized in this document's "Object rescale" section above and
+doesn't need to be re-read from the plan file).
+
+**Stage 4 (full run) not started.**
+
+## 2026-09-30 environment incident: RESOLVED -- see `docs/2026-09-30_isaac_startup_crash.md`
+
+**Root cause found and fixed, from a second-opinion session run in parallel on this same
+machine/repo.** Short version: `import omnigibson` loads h5py 3.16.0 (bundling HDF5 2.0.0) before
+Kit starts; Kit's `omni.sensors.nv.common` extension then tries to load its own private HDF5 1.14.4
+DLLs (`hdf5_hl.dll`/`hdf5_cpp.dll`), but Windows resolves the request against the *already-loaded*
+HDF5 2.0.0 DLL of the same name instead of loading the private copy -- a classic DLL-name-collision
+bug, not a version mismatch this repo controls. The resulting `ERROR_PROC_NOT_FOUND` (`0xc0000139`)
+was the thing this whole investigation below correctly kept seeing but wrongly classified as
+"known harmless noise" (an error this document itself repeated from before this incident). When
+that failure's exception print raced against a concurrent OGN-node-scan thread, the two together
+took down the interpreter -- explaining both the "crash" and "hang" symptoms as one mechanism, not
+two. Fix: pin `h5py==3.14.0` (bundles HDF5 1.14.6, matching Kit's own copy) --
+`pip install --no-deps h5py==3.14.0`. Verified with three consecutive clean settle-check runs on
+both the WidowX AI and Fetch configs, and a user-run `main.py` GUI session matching 2026-09-24
+behavior. **Read `docs/2026-09-30_isaac_startup_crash.md` in full before touching anything below
+this point** -- it also documents where this document's own investigation went wrong (calling the
+hdf5 errors harmless, treating `check_kit_bare.py` as a clean minimal repro when it actually tripped
+a second, unrelated DLL collision of its own) so the same mistakes aren't repeated. Two open items
+from that doc worth carrying forward: why this started on 2026-09-30 specifically (h5py 3.16.0 was
+installed 2026-07-24, so the collision predates the incident -- unconfirmed theory is that this
+session's own OGN-cache clearing, done while chasing this exact bug, made the OGN scan start
+running on every launch instead of hitting a cache and skipping it) and that a future
+`pip install -U`/reinstall of OmniGibson's dependencies can silently re-break this by pulling
+h5py back above 3.14.x.
+
+<details>
+<summary>Investigation history below this point, kept for the record -- superseded by the
+resolution above, several conclusions in here are wrong (see "調査で誤っていた点" in
+`docs/2026-09-30_isaac_startup_crash.md`)</summary>
+
+Isaac Sim will not start at all on this machine right now
 
 Not caused by, or specific to, the object-rescale work above -- reproduces identically on the
 completely untouched Fetch path (`configs/config.yaml`, `configs/og_scene_file_pen.json`). Blocks
@@ -787,6 +849,12 @@ doing for hygiene (quieter `pip check`), but it is not expected to, and did not 
 hang itself -- the hang's cause is still open, narrowed only as far as "somewhere in Isaac Sim / Kit
 / GPU runtime, independent of OmniGibson or this branch" (see the minimal-repro-ladder result
 above).
+
+*(Everything from here up to this point turned out to be the wrong track, superseded by the actual
+root cause and fix in `docs/2026-09-30_isaac_startup_crash.md` -- see the RESOLVED note at the top
+of this incident.)*
+
+</details>
 
 ## Reference: the seven incompatibilities found so far
 

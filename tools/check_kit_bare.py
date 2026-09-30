@@ -10,14 +10,29 @@ still hits the same quiet-exit or crash, the failure is in Kit's own core (exten
 rendering) and has nothing to do with anything OmniGibson adds. If this succeeds cleanly, the next
 rung (`check_og_minimal.py`) narrows it down further.
 
+**Not actually a clean minimal repro of the 2026-09-30 hang -- see
+`docs/2026-09-30_isaac_startup_crash.md`.** That incident's root cause was an hdf5 DLL-name
+collision between h5py's bundled HDF5 and Kit's own private copy, triggered by `import
+omnigibson` loading h5py *before* Kit starts. This script never imports omnigibson, so it dodges
+that collision -- but it built to trip a second, unrelated DLL-name collision instead (Kit's
+bundled `msvcp140.dll` 14.29 vs. torch's `c10.dll`, only when Kit starts before torch does).
+Importing torch first, as OmniGibson itself does before this script would even run, avoids it.
+
 Companion to `docs/widowxai_bringup_status.md`'s "2026-09-30 environment incident" -- see the
-minimal-repro-ladder plan recorded there before adding further rungs.
+minimal-repro-ladder plan recorded there, and the resolution in
+`docs/2026-09-30_isaac_startup_crash.md`, before treating this script's result as meaningful on
+its own.
 """
 import os
 import sys
 import time
 
 sys.path.insert(0, ".")
+
+# Must happen before `from isaacsim import SimulationApp` -- see the msvcp140 collision note
+# above. OmniGibson's own `import omnigibson` pulls in torch first for the same reason; this
+# script has no omnigibson import to do that for it, so it has to do it explicitly.
+import torch  # noqa: E402,F401
 
 
 def main():
