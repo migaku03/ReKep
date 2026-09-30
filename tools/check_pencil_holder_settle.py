@@ -18,6 +18,11 @@ This script does NOT modify anything. It loads the real scene through ReKepOGEnv
 main.py uses) for whichever --config is given, reports table_1/pencil_holder_1's position and aabb
 right after load, then steps physics 60 more times and reports again, so a regression shows up as
 the second report differing from the first (or from the equivalent run for the other robot).
+
+--scene_file lets this double as the settle check for the rescaled-object fork
+(configs/og_scene_file_pen_widowxai.json, see the object-rescale plan in
+docs/widowxai_bringup_status.md) -- pen_1 is reported too there, since a much thinner pen is more
+likely to roll or tip than the old fat one.
 """
 import argparse
 import sys
@@ -32,6 +37,7 @@ def main():
 
     p = argparse.ArgumentParser()
     p.add_argument("--config", default="./configs/config.yaml")
+    p.add_argument("--scene_file", default="./configs/og_scene_file_pen.json")
     args = p.parse_args()
 
     # Reuse ReKep's own environment wrapper (same path main.py uses) rather than hand-building
@@ -42,10 +48,11 @@ def main():
     from utils import get_config
 
     global_config = get_config(config_path=args.config)
-    rekep_env = ReKepOGEnv(global_config['env'], './configs/og_scene_file_pen.json', verbose=False)
+    rekep_env = ReKepOGEnv(global_config['env'], args.scene_file, verbose=False)
     env = rekep_env.og_env
     table = env.scene.object_registry("name", "table_1")
     holder = env.scene.object_registry("name", "pencil_holder_1")
+    pen = env.scene.object_registry("name", "pen_1")
 
     def to_np(x):
         return np.asarray(x.cpu() if hasattr(x, "cpu") else x, dtype=float)
@@ -63,6 +70,7 @@ def main():
 
     report("table_1 (after ReKepOGEnv load)", table)
     report("pencil_holder_1 (after ReKepOGEnv load)", holder)
+    report("pen_1 (after ReKepOGEnv load)", pen)
 
     robot = env.robots[0]
     r_pos, r_orn = robot.get_position_orientation()
@@ -80,6 +88,7 @@ def main():
     for _ in range(60):
         og.sim.step()
     report("pencil_holder_1 (after 60 more steps)", holder)
+    report("pen_1 (after 60 more steps)", pen)
 
     og.shutdown()
     return 0

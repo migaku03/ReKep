@@ -502,6 +502,16 @@ if __name__ == "__main__":
             'rekep_program_dir': './vlm_query/pen',  # the author's 2024 cached query
             'disturbance_seq': {1: stage1_disturbance_seq, 2: stage2_disturbance_seq, 3: stage3_disturbance_seq},
             },
+        # Same task, but pen_1/pencil_holder_1/table_1 rescaled to realistic real-world sizes
+        # (docs/widowxai_bringup_status.md, "Object and robot scale, measured") instead of the
+        # Fetch-era oversized ones -- og_scene_file_pen.json is left untouched so Fetch keeps
+        # working on the fat pen its assisted-grasp geometry actually needs (see the scale
+        # comment in og_scene_file_pen_widowxai.json's derivation, docs/widowxai_bringup_status.md).
+        'pen_widowxai': {
+            'scene_file': './configs/og_scene_file_pen_widowxai.json',
+            'instruction': 'reorient the white pen and drop it upright into the black pen holder',
+            'rekep_program_dir': './vlm_query/pen_widowxai',
+            },
     }
     task = task_list['pen']
     scene_file = task['scene_file']
