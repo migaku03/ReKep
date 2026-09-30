@@ -4,8 +4,9 @@ Working state for `robot/widowx-ai`, written to survive a context compaction. Re
 when resuming; it is the state of *this branch*, which is why it lives here and not in the parent
 repo's `docs/`.
 
-Last updated: 2026-09-24 (bring-up complete: grasp holds reliably, stalls afterward at a joint
-limit -- known, out-of-scope cause; task-object/table scale measured. See Stage 4 attempts 4-5.)
+Last updated: 2026-09-30 (object-rescale work started -- scene forked, pen/holder/table scaled to
+real-world sizes -- then blocked before any verification run by a machine-level Isaac Sim startup
+failure unrelated to this branch. See "Object rescale" and "2026-09-30 environment incident" below.)
 
 ## What this is
 
@@ -524,6 +525,268 @@ the *input* didn't change; it does not prove the *behaviour* is robot-independen
 placement is a variable that can disturb shared scene state through physics. When a shared-looking
 resource misbehaves only under one config, test that directly (same loader, both configs) before
 concluding it is pre-existing and unrelated.
+
+## Object rescale (2026-09-30): plan, work done so far, currently blocked
+
+Follow-up to the "Object and robot scale, measured" section above. The user asked to restore
+`pen_1`/`pencil_holder_1`/`table_1` to real-world sizes and, accepting that this would likely
+break the grasp/keypoint geometry again, to fix whatever that breaks until the full pen task
+(grasp -> reorient -> drop in holder) actually completes -- not just the "starts without crashing"
+bar this document was scoped to before. Full plan recorded at
+`C:\Users\smiga\.claude\plans\lucky-splashing-lobster.md`. New process rules from the user for this
+piece of work: every `main.py` run is headless and timeboxed (5 min), and if one specific blocking
+symptom survives four consecutive fix attempts, stop and re-examine the approach before a fifth.
+
+**Stage 1 (measure), done.** `tools/measure_native_scale.py` (new) reads each object's
+`ig:nativeBB` (`DatasetObject.native_bbox`, the same source commit `81b41ea` used) to get scale-1
+dimensions without eyeballing. Findings:
+- `pen_1`: native `[18.65, 1.03, 0.91]` cm. `81b41ea` fattened it to `[1.3,3.0,3.0]` scale
+  specifically so Fetch's assisted-grasp rays (fixed at eef-frame z=+-1.96cm) would still cross a
+  pen resting on the table -- a Fetch-specific constraint. WidowX AI's own assisted-grasp rays
+  (`robots/widowxai.py` `_ag_start_points`/`_ag_end_points`) are two per-finger-link ray pairs
+  spanning the jaw gap, not a fixed z-band, so they're expected to be far less sensitive to pen
+  thickness -- reasoned from the code, not yet verified empirically (blocked, see below).
+- `pencil_holder_1`: native `[10.51, 10.60, 12.29]` cm -- realistic cup size at scale 1 already
+  (current scale only inflates the footprint, not the height).
+- `table_1`: scale is a bare scalar `2`; native bbox `[49.74, 119.38, 34.49]` cm, orientation
+  confirmed axis-aligned with world (quaternion ~identity). Decision: keep height (scale_z=2,
+  ~69.7cm, already realistic) and width (scale_x=2, ~102cm) unchanged, shrink only the
+  241cm-long axis to ~140cm (scale_y=1.17).
+
+**Stage 2 (fork + rescale), done, not yet verified or committed.**
+- `configs/og_scene_file_pen_widowxai.json` (new, uncommitted): forked from
+  `configs/og_scene_file_pen.json` (which stays untouched -- ground rule: Fetch's grasp needs the
+  fat pen, so the shared file cannot be rescaled). Only the three `scale` fields changed:
+  `pen_1` `[1.3,3.0,3.0]`->`[1.0,1.0,1.0]`, `pencil_holder_1` `[1.5,1.5,1.0]`->`[1.0,1.0,1.0]`,
+  `table_1` `2`->`[2.0,1.17,2.0]`. Positions/orientations deliberately left untouched -- reasoned
+  (not yet confirmed by a run) that the resulting few-mm/cm offsets from each object's local
+  origin not being at its geometric center will resolve the same way the settle loop already
+  resolves the robot/table overlap (see "Stage 4, attempt 4" above), rather than hand-deriving
+  `base_link_offset` math per object.
+  - Because scale_x/scale_z are unchanged for the table and pen/holder positions weren't moved,
+    reasoned that the robot's `position` and `bounds_min`/`bounds_max` x/z in
+    `configs/config_widowxai.yaml` do **not** need to change for this pass -- not yet verified.
+- `main.py`: added `task_list['pen_widowxai']` (scene file above,
+  `rekep_program_dir: './vlm_query/pen_widowxai'`), selected with `--task pen_widowxai`.
+- `tools/check_pencil_holder_settle.py`: extended with `--scene_file` and a `pen_1` report (a
+  thinner pen is more likely to roll/tip than the old fat one) -- written but never successfully
+  run against the new scene file (blocked, see below).
+- **Not yet run, not yet committed.** `git status` on this branch currently shows: `main.py` and
+  `tools/check_pencil_holder_settle.py` modified, `configs/og_scene_file_pen_widowxai.json` and
+  `tools/measure_native_scale.py` untracked.
+
+**Stage 3 (keypoint regeneration) and Stage 4 (full run) not started** -- blocked before Stage 2's
+own verification could run. See the plan file for what they involve.
+
+## 2026-09-30 environment incident: Isaac Sim will not start at all on this machine right now
+
+Not caused by, or specific to, the object-rescale work above -- reproduces identically on the
+completely untouched Fetch path (`configs/config.yaml`, `configs/og_scene_file_pen.json`). Blocks
+*any* OmniGibson/Isaac Sim run on this machine, so it blocks Stage 2's verification onward.
+Recorded in detail because the investigation was long and the negative results (what it *isn't*)
+are as valuable as a fix would have been, if this resurfaces after a context compaction.
+
+**Symptom.** Every launch of `og.Environment()` (via `ReKepOGEnv`, so `tools/check_pencil_holder_settle.py`,
+`tools/measure_native_scale.py`, and presumably `main.py`) either crashes or hangs during startup,
+before any of the caller's own code runs. Last confirmed working: 2026-09-24 (this document's own
+Stage 4 attempts 3-5, full 5-minute runs). First confirmed broken: 2026-09-30, this session's very
+first launch attempt, and every attempt since (10+ separate launches, by both the user and me).
+
+**What it is not -- ruled out, in the order investigated:**
+1. **Not the object-rescale changes.** Reproduces identically with `--config ./configs/config.yaml`
+   pointed at the untouched `og_scene_file_pen.json` -- no file this branch's rescale work touched
+   is involved.
+2. **Not simple retry-able flakiness.** The bring-up doc already had one documented, intermittent
+   case of `Windows fatal exception: code 0xc0000139` at startup, historically resolved by 1-2
+   retries after confirming GPU/processes were clear. This time: 7+ consecutive failures across
+   both the user's machine session and mine, with GPU memory confirmed at 0 MiB and no orphaned
+   `python.exe` before every attempt.
+3. **The `0xc0000139` console message itself turned out to be a red herring.** It's Python's
+   faulthandler reporting a benign, already-known, non-fatal event: `omni.sensors.nv.common`'s
+   bundled `hdf5_hl.dll`/`hdf5_cpp.dll` failing to load (`[Error] [omni.ext.plugin] Could not load
+   the dynamic library... Error: 指定されたプロシージャが見つかりません` = ERROR_PROC_NOT_FOUND,
+   the Win32-level version of the same NTSTATUS). Kit catches this and continues; it is not what
+   kills the process. This was already flagged as harmless noise elsewhere in this document
+   ("Log noise that is not a failure") but had not been connected to this NTSTATUS code before.
+4. **Not KB5129195** (a Security Update installed 2026-09-24, the same day as the last known-good
+   run -- the obvious first suspect). Windows Event Viewer's Application log showed the *actual*
+   fatal crash (as opposed to the benign hdf5 noise above) is `python.exe` faulting inside
+   `C:\Windows\System32\ucrtbase.dll` (version `10.0.26100.9444`), exception code `0xc0000409`
+   (`STATUS_STACK_BUFFER_OVERRUN`, a `/GS` stack-cookie failure), at the *same faulting offset*
+   (`0x00000000000a527e`) on every single occurrence -- deterministic, not a race. The user
+   uninstalled KB5129195 and rebooted. Result: `ucrtbase.dll`'s version number was **unchanged**
+   after the rollback, and the crash still reproduced identically. This falsifies KB5129195 as the
+   cause (either it never touched `ucrtbase.dll`, or something else is responsible).
+5. **Not the GPU driver.** `Get-CimInstance Win32_PnPSignedDriver` shows the NVIDIA driver
+   unchanged since 2025-07-27, both before and after the KB rollback/reboot. No TDR, display-driver
+   crash, or Kernel-Power events in the System event log in the relevant window -- rules out a hard
+   driver crash/reset, not just a version check.
+6. **Not disk space** (553.6 GB free on `C:`).
+7. **Not "Windows 11 25H2 itself."** The user's own hypothesis, reasonably: something at the OS
+   version level regressed, so downgrade Windows. Checked via the Update COM API's full history
+   (`Microsoft.Update.Session` -> `QueryHistory`, not just `Get-HotFix`, which misses feature
+   updates): 25H2 was installed **2026-06-09** -- over three and a half months before this started,
+   including through the 2026-09-24 runs that worked fine. An incompatibility present since June
+   would not explain a break starting in late September. (Note for anyone revisiting: 25H2 ships as
+   an "enablement package" on top of 24H2's binaries, which is why `ucrtbase.dll` above still
+   reports as build `26100.x` rather than `26200.x` -- a real oddity, just not this one.)
+8. **System Restore is not available as a path either way.** No restore points exist predating
+   2026-09-30 (today), and no `$WINDOWS.~BT` rollback data exists on disk for the standard
+   Windows-Update "go back" option. A Windows downgrade, if it ever becomes necessary, would mean a
+   clean reinstall, not a quick rollback -- worth knowing before reaching for that option again.
+
+**Unresolved lead, not confirmed:** the Windows Update COM history shows the
+`Microsoft.WindowsAppRuntime.2` package reinstalling itself many times in a short window on
+2026-09-29 (14:52-14:59). Suspicious timing (one day before this started), but no mechanism found
+connecting a Windows App SDK runtime package to `System32\ucrtbase.dll` or to Isaac Sim's own
+extension loading. Flagged for whoever picks this up next, not chased further.
+
+**Own-caused corruption, tried, made things *worse* not better -- important for whoever revisits
+this.** This session's own repeated forced timeouts/kills of Isaac Sim (10+ over the course of the
+investigation) is a plausible source of corrupted regenerable state, since Kit caches are written
+continuously during a run. Backed up (renamed, not deleted) and let Isaac Sim regenerate:
+`C:\...\BEHAVIOR-1K\OmniGibson\appdata\local\cache\{ogn_generated,Kit,nv_shadercache,shadercache,DerivedDataCache}`
+and `C:\Users\smiga\AppData\Local\NVIDIA\warp\Cache\1.5.0`. Tried in two steps:
+- Cleared only `ogn_generated` + `Kit`: the failure point moved *later* -- instead of dying at ~7s
+  during extension loading, the process now got all the way through scene + robot load (the
+  `[environment.py] AABB table_1/pen_1/pencil_holder_1` lines printed correctly) and ran ~55s into
+  camera/renderer initialization before terminating with **no Python exception at all** and exit
+  code 0 -- not even this session's own script's `report()` output, despite explicit
+  `flush=True`. A real change in behaviour, but still not a working run.
+- Also cleared `nv_shadercache`, `shadercache`, `DerivedDataCache`, and the Warp cache: the process
+  stopped crashing entirely, but also never progressed past `[8.787s] app ready` (an early
+  Kit-internal timestamp) for 9+ minutes before being force-stopped -- a complete hang, confirmed by
+  comparing the log's last timestamp against wall-clock time, not just slow shader recompilation.
+- **Interpretation:** clearing progressively more cache changed *which* symptom appeared (early
+  crash -> late crash -> hang) rather than fixing anything, and clearing *more* made it *worse*
+  (hang instead of crash). This points away from "a specific corrupted cache file" and toward "some
+  GPU/renderer-heavy parallel operation (bulk shader compilation, multi-threaded OGN module
+  scanning/import) cannot currently complete successfully on this machine" as the more likely
+  underlying issue -- cache state just changes where in that broken process it gets stuck.
+- **All backed-up caches were restored to their original names/contents** (user's instruction,
+  since clearing them had not helped and had briefly made the failure mode worse). Confirmed no
+  `.bak` directories remain and file counts match pre-backup state.
+
+**Current status as of the cache-clearing round above: root cause not identified.** Blocks all
+further verification (Stage 2 onward above) until resolved. The code-side changes from Stage 1-2
+above are believed correct (reasoned from measured data, following established patterns on this
+branch) but **completely unverified by any actual run** -- treat them as a hypothesis, not a
+confirmed fix, when resuming. Do not re-attempt the cache-clearing approach without a new reason to
+believe it will behave differently this time; it was tried and made things worse, not better.
+
+## 2026-09-30 continued: reframing "crash" as "hang", and isolating it to Kit itself
+
+Picked back up after the cache-clearing round above with a more systematic pass, following a
+second opinion the user brought in. Two corrections to the mental model above, plus one narrowing
+result -- read this before touching anything from the sections above again.
+
+**Correction 1: `sfc`/`DISM`, a full `isaacsim-*`/`omniverse-kit` pip reinstall, and disabling
+Windows Defender real-time protection were all tried and changed nothing.** `sfc /scannow` found
+and repaired 1601 file-flag corruptions (metadata-level, not payload -- `CSI Payload Corruption: 0`
+in `C:\Windows\Logs\CBS\CBS.log`); symptom unchanged after. Reinstalling every `isaacsim-*` and
+`omniverse-kit` pip package (`pip install --force-reinstall --no-deps ...`) completed successfully
+(one transient `WinError 32` file-lock on retry, then clean); symptom unchanged after. Disabling
+Defender's real-time protection (had to go through the Windows Security GUI -- Tamper Protection
+silently no-ops `Set-MpPreference -DisableRealtimeMonitoring $true` from PowerShell, confirmed by
+`RealTimeProtectionEnabled` staying `True` after running it); symptom unchanged after, and critically
+**no WER crash event was generated for that run at all** -- see correction 2. Re-enable Defender's
+real-time protection if it's still off from this.
+
+Also checked and ruled out further: `chkdsk C:` (read-only) found zero problems and zero bad
+sectors -- the filesystem itself is not corrupted. This matters because reinstalling
+`isaacsim-extscache-kit` left a stray `~saacsim_extscache_kit-4.5.0.0.dist-info` directory (a
+truncated name, Windows' marker for an interrupted delete/rename) and the installed package tree
+separately contains a `~onfig` directory under `omni.services.core-1.9.0` with the same truncated-
+name pattern -- worth knowing about (something keeps interrupting file operations on this install
+tree) but not filesystem corruption per `chkdsk`; more likely a file transiently locked by another
+process (AV scan, indexer) at the moment of the operation.
+
+One more avenue chased and ruled out: `OMNIGIBSON_DEBUG=1` (see below) newly surfaced
+`[Error] [omni.graph.core._impl.extension] OGN node registration completed with errors: cannot
+import name 'collect_definitions' from 'pydantic._internal._core_utils'` immediately before one
+crash. Investigated as a possible real cause (`pydantic` 2.13.4 is installed, pulled in by `openai`/
+`dash`, neither of which Isaac Sim itself depends on; `collect_definitions` genuinely does not exist
+in that file at this version) -- **but `pydantic`, `pydantic_core`, `openai`, and `dash` were all
+installed 2026-07-24, long before the 2026-09-24 last-known-good date, so this incompatibility was
+already present on the day everything worked.** Not the trigger; still worth fixing eventually
+(pin `openai`/`dash` off this environment or find a version combination that satisfies both sides),
+but ruled out as *this* incident's cause.
+
+**Correction 2, important: most of what this document has been calling "crash" is actually "hang."**
+`Windows fatal exception: code 0xc0000139` and the accompanying Python thread dumps, seen
+repeatedly throughout this document, are produced by Python's `faulthandler` -- and faulthandler
+dumps fire on a timer/signal, not only on an actual fatal fault. Direct evidence: running
+`tools/check_kit_bare.py` (new, see below) produced **eight separate thread-dump blocks over two
+minutes while the process was still alive** (confirmed via `tasklist` and non-zero, static GPU
+memory usage the whole time) -- not eight crashes. The process was truly hung (no log output, no
+GPU memory change, for the full two minutes it was watched) and had to be force-killed
+(`taskkill //PID <pid> //F`); it did not crash on its own. This reframes the earlier "early crash
+vs. quiet exit, changing with cache state" observation: both are very plausibly the same underlying
+hang, just sampled at different points by whatever finally ends the process (a faulthandler dump
+that happens to coincide with process teardown, a timeout, or in this case a manual kill) --  not
+two different failure modes.
+
+**Narrowing result: the hang reproduces with no OmniGibson code involved at all.**
+`tools/check_kit_bare.py` (new) boots `isaacsim.SimulationApp` directly -- no `og.Environment()`,
+no OmniGibson import, no `omnigibson_4_5_0.kit` (OmniGibson's much larger kit-file with physics/
+robotics/replicator extensions layered in); just the default Isaac Sim application the pip install
+ships. It still hung, mid-way through extension startup, stuck importing
+`isaacsim.extsdeprecated/omni.isaac.core/omni/isaac/core/physics_context/physics_context.py` (the
+last frame in every thread-dump sample). GPU memory was nonzero (325 MiB) and static the whole time
+-- something had partially initialized on the GPU and then stopped making progress.
+
+**This rules out OmniGibson, this branch's `environment.py`, and the object-rescale work as the
+cause, completely.** The hang is in Isaac Sim / Omniverse Kit's own extension-loading machinery (or
+something underneath it -- GPU driver/runtime interaction, most likely, given the plateaued but
+nonzero GPU memory), independent of anything this repository does. Whoever picks this up next
+should stop looking at ReKep/OmniGibson code entirely and treat this as an Isaac Sim / Kit / GPU
+runtime issue on this specific machine.
+
+**In progress, not yet done:** the rest of the minimal-repro ladder (`tools/check_og_minimal.py`,
+`tools/check_og_robot_only.py` -- planned but not yet written as of this entry), a Process Monitor
+capture around the hang (tool not yet installed on this machine), and a GPU-health snapshot taken
+*during* a hang rather than at idle (the idle baseline: 43-44C, no active thermal/power slowdown,
+a `SW Thermal Slowdown` cumulative counter around 74.9-75.0 ms whose trend is inconclusive from two
+samples). Full plan for this pass recorded at `C:\Users\smiga\.claude\plans\lucky-splashing-lobster.md`.
+
+Verbose logging note for reproducing any of the above: OmniGibson wraps Kit startup in a log-
+suppressing context manager by default; `export OMNIGIBSON_DEBUG=1` (reads through to
+`gm.DEBUG`, `OmniGibson/omnigibson/macros.py:164`) disables that suppression and is worth setting
+alongside `OMNIGIBSON_HEADLESS=1` for any OmniGibson-path repro from here on -- `check_kit_bare.py`
+doesn't need it since it does not go through OmniGibson's `simulator.py` at all.
+
+**Follow-up on the two leads above, both closed out:**
+
+- **The truncated-name directories predate this incident and are not a live filesystem problem.**
+  Checked timestamps: `~onfig`/`~ata`/`~ocs`/`~ackage-licenses` under
+  `.../isaacsim/extscache/omni.services.core-1.9.0/` were all created **2026-07-25 00:29:05** --
+  the same moment as the rest of that initial `pip install`, over two months before the 2026-09-24
+  last-known-good boundary. Whatever caused pip's wheel extraction to truncate these four directory
+  names on this machine happened once, at initial install, and this exact state was already present
+  and already harmless on every working day since. Not a new or ongoing filesystem problem --
+  `chkdsk C:` (read-only) already confirmed zero errors and zero bad sectors separately. Cleaned up
+  anyway (removed, since the correctly-named `config`/`data`/`docs`/`PACKAGE-LICENSES` siblings
+  already existed and worked): both this quartet and the newer
+  `~saacsim_extscache_kit-4.5.0.0.dist-info` (created today, from the earlier `WinError 32`
+  mid-reinstall file-lock). `pip check` is now clean (only the pre-existing, unrelated
+  `torch`/`setuptools` version-range warning remains).
+- **The `pydantic`/`omni.services.core` incompatibility: confirmed pre-existing, left alone.**
+  `pydantic` 2.13.4, `pydantic_core`, `openai`, and `dash` were all installed **2026-07-25 00:28-
+  00:29** as well -- the same install, same timestamp cluster as the directories above. This
+  incompatibility has been present, and presumably logging the same error, on every run since this
+  environment was first set up, including every working run through 2026-09-24. Decision: leave the
+  `pydantic` version as-is rather than downgrading it to satisfy `omni.services.core` -- `openai`
+  and `dash` (real ReKep/tooling dependencies) need the current version, `omni.services.core` is an
+  unused Kit web-services extension neither OmniGibson nor ReKep's own code exercises, and the
+  incompatibility is not implicated in the hang (ruled out by the timestamp evidence above). Revisit
+  only if something *else* is found to actually need `omni.services.core` working.
+
+**Net effect of this sub-investigation:** both leads looked promising but turned out to be old,
+inert state rather than anything related to the 2026-09-30 hang. Removing the debris was worth
+doing for hygiene (quieter `pip check`), but it is not expected to, and did not need to, change the
+hang itself -- the hang's cause is still open, narrowed only as far as "somewhere in Isaac Sim / Kit
+/ GPU runtime, independent of OmniGibson or this branch" (see the minimal-repro-ladder result
+above).
 
 ## Reference: the seven incompatibilities found so far
 
